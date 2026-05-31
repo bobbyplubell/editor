@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "editor-core",
+    "editor-view",
+    "editor-egui",
+    "editor-md",
+    "editor-diff",
+    "editor-ts",
+    "examples/minimal",
+    "examples/markdown",
+    "examples/diff",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/bobbyplubell/editor"
+
+[workspace.dependencies]
+# --- Editor sub-crates ---
+editor-core = { path = "editor-core" }
+editor-view = { path = "editor-view" }
+editor-egui = { path = "editor-egui" }
+editor-md = { path = "editor-md" }
+editor-diff = { path = "editor-diff" }
+editor-ts = { path = "editor-ts" }
+
+# --- egui ecosystem ---
+egui = "0.32"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }
+
+# --- Markdown + syntax ---
+pulldown-cmark = { version = "0.13", default-features = false }
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
+tree-sitter-sequel = "0.3"
+
+# --- Support crates ---
+serde = { version = "1", features = ["derive"] }
+similar = { version = "2.6", default-features = false, features = ["text"] }
+smallvec = "1.13"
+smol_str = "0.3"
+proptest = "1.5"
+unicode-segmentation = "1.12"
+web-time = "1"
+regex = "1"
+
+[profile.release]
+lto = "thin"
+
+# Optimize dependencies in debug builds so `cargo run` on the examples is
+# usable. Without this, egui's tessellator + epaint + the editor crates run
+# 10-100x slower than release and scrolling a small file feels laggy even
+# though there's nothing structurally wrong. Standard Bevy / egui pattern.
+[profile.dev.package."*"]
+opt-level = 3
+
+# The editor crates run on the per-frame hot path (rope, decorations,
+# heightmap, wrap, paint). Build them with light optimization in debug too —
+# they recompile rarely so the compile-time cost is amortized.
+[profile.dev.package.editor-core]
+opt-level = 3
+[profile.dev.package.editor-view]
+opt-level = 3
+[profile.dev.package.editor-egui]
+opt-level = 3
+[profile.dev.package.editor-md]
+opt-level = 3
+[profile.dev.package.editor-diff]
+opt-level = 3
+
+[workspace.lints.clippy]
+too_many_lines = "deny"

@@ -11,7 +11,7 @@ use editor_md::meta::FRONTMATTER_FOLD_ID;
 #[test]
 fn wikilink_path_form_emits_replace_and_mark_when_cursor_off_line() {
     // Under path-form (`wikilink-path-form`) both a bare basename and an
-    // explicit vault-relative path are valid bodies; both should collapse to
+    // explicit workspace-relative path are valid bodies; both should collapse to
     // a Replace + Mark when the cursor is off the link's line. There is no
     // `|alias` half — the body is the target verbatim and its label.
     for src in [

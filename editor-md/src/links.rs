@@ -5,7 +5,7 @@
 //! visible for editing (the standard live-preview reveal).
 //!
 //! Under the path-form (`wikilink-path-form`) the body is the target verbatim
-//! — a bare basename (`Name`) or a vault-relative path without the `.md`
+//! — a bare basename (`Name`) or a workspace-relative path without the `.md`
 //! extension (`folder/sub/Name`). There is no `|display` alias half.
 //!
 //! A host may pass a `resolve` closure mapping a link target to the note's
@@ -41,7 +41,7 @@ pub const COLOR_WIKILINK_UNRESOLVED: Color = Color::rgb(224, 108, 117);
 /// apart from other inline-widget click consumers (patch-review, diff hunks).
 pub const WIKILINK_WIDGET_TAG: u64 = 1 << 62;
 
-/// Resolver closure: target (a vault path or bare basename) → the note's
+/// Resolver closure: target (a workspace path or bare basename) → the note's
 /// current display title, or `None` when the target can't be resolved.
 pub type TitleResolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
 

@@ -26,7 +26,7 @@ struct PaletteEntry {
     color: Color,
 }
 
-/// Display palette aimed at hiker's default light theme (off-white background);
+/// Display palette aimed at a default light theme (off-white background);
 /// inspired by One Light / Catppuccin Latte. Names are the standard
 /// tree-sitter highlight tags; adding a new tag is one row here.
 const PALETTE: &[PaletteEntry] = &[
