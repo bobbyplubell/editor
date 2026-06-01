@@ -1,7 +1,5 @@
 //! `Widget`: drop-in egui widget for an EditorState + ViewState pair.
 
-use std::sync::Arc;
-
 use editor_core::decoration::BlockDeco;
 
 use editor_core::decoration::BlockSide;
@@ -12,7 +10,6 @@ use editor_core::decoration::Decoration;
 
 use editor_core::state::Editor as EditorState;
 use editor_core::transaction::Transaction;
-use editor_core::decoration::InlineWidget;
 
 use editor_core::decoration::LineStyle;
 
@@ -27,10 +24,14 @@ use editor_view::events::InputEvent;
 use editor_view::viewport::ViewState;
 use editor_view::wrapping::VisualSpan;
 mod blocks;
+mod inline_paint;
 pub(crate) mod layout;
 mod search_panel;
+pub mod texture_cache;
 use blocks::{BlockPaint, BlockZone};
+use inline_paint::{galley_ascent, SegSpan};
 use layout::{LineLayout, LineLayoutBuilder, LineMeasured};
+use texture_cache::TextureCache;
 
 /// Per-frame snapshot of the inputs that feed the measure pass. Compared
 /// against `ViewState::measure_cache` to decide whether geometry needs to be
@@ -73,6 +74,10 @@ struct CachedRow {
 pub struct PaintCache {
     frame: u64,
     entries: std::collections::HashMap<(usize, usize), CachedRow>,
+    /// Pixel-widget texture cache (slug `widget-painter-texture-blit`). Keyed
+    /// by `(widget_id, width, height)`; uploaded on a cache miss, reused on a
+    /// hit, and evicted at frame end for any entry not blitted this frame.
+    textures: TextureCache,
 }
 
 impl PaintCache {
@@ -542,6 +547,16 @@ fn apply_line_height_decorations(&mut self) {
         return;
     }
     let doc_len = state.doc.len_bytes();
+    // Per-line tallest inline widget (logical points), accumulated during the
+    // scan below and applied as a row-height floor afterwards. An inline math
+    // formula (a fraction, a `\sum` with limits) measures taller than the text
+    // line; its visual row must grow to that height so the blit paints at full
+    // resolution rather than being clipped to the text line (slug
+    // `widget-inline-math-baseline`). Kept separate from the main pass because
+    // `set_line_height` is absolute — we want a `max`, applied once per line
+    // after headings/hides have set the text height.
+    let mut inline_widget_heights: std::collections::BTreeMap<usize, f32> =
+        std::collections::BTreeMap::new();
     // Only scan layers flagged as height-affecting. The painter still walks
     // every layer separately for marks/replace/widgets.
     for layer in view.decorations.height_layers() {
@@ -570,8 +585,26 @@ fn apply_line_height_decorations(&mut self) {
                         BlockSide::Below => view.height_map.add_block_below(line, h),
                     }
                 }
+                Decoration::InlineWidget { widget, .. } => {
+                    let line = state.doc.byte_to_line(range.start.min(doc_len));
+                    let h = widget.measure(view.font_size).1;
+                    let slot = inline_widget_heights.entry(line).or_insert(0.0);
+                    if h > *slot {
+                        *slot = h;
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+    // Grow each line's text row to fit its tallest inline widget. Only lines
+    // that are visible (not hidden, text_height > 0) participate — a hidden
+    // line stays collapsed. Applied before the soft-wrap multiplier so a grown
+    // base row is multiplied per visual row consistently with headings.
+    for (&line, &widget_h) in &inline_widget_heights {
+        let text_h = view.height_map.text_height(line);
+        if text_h > 0.0 && widget_h > text_h {
+            view.height_map.set_line_height(line, widget_h);
         }
     }
     // Apply soft-wrap multiplier: a line with N visual rows is N× taller
@@ -606,18 +639,6 @@ struct RowSpan {
     height: f32,
 }
 
-/// Geometry of one inline segment's placeholder box: its horizontal
-/// extent (`x`, `width`), the row band it sits in (`top_y`, `height`),
-/// and the baseline `label_y` for any text drawn inside. `Copy`.
-#[derive(Clone, Copy)]
-struct SegSpan {
-    x: f32,
-    width: f32,
-    top_y: f32,
-    height: f32,
-    label_y: f32,
-}
-
 struct PaintCtx<'a> {
     ui: &'a mut egui::Ui,
     state: &'a EditorState,
@@ -648,6 +669,9 @@ fn paint(
     cache.frame = cache.frame.wrapping_add(1);
     // Evict rows untouched for more than ~120 frames (≈2 seconds at 60 Hz).
     cache.evict_stale(120);
+    // Widget textures are tracked per-frame: any not blitted this pass (closed
+    // buffers, scrolled-off widgets) are dropped at the end of `paint`.
+    cache.textures.begin_frame();
 
     let visuals = ui.visuals().clone();
     let painter = ui.painter_at(rect);
@@ -745,6 +769,9 @@ fn paint(
         let until_next_ms = until_next_ms.max(1);
         ctx.ui.ctx().request_repaint_after(std::time::Duration::from_millis(until_next_ms));
     }
+
+    // Drop widget textures not blitted this frame (closed/scrolled-off widgets).
+    cache.textures.evict_unused();
 }
 }
 
@@ -821,6 +848,7 @@ impl<'a> PaintCtx<'a> {
                 hatched_default: self.hatched_default,
                 click_zones: &mut self.view.click_zones,
                 widget_rect: self.rect,
+                texture_cache: &mut self.cache.textures,
             }
             .paint_zone(&BlockZone {
                 layers: &self.view.decorations.layers,
@@ -882,6 +910,7 @@ impl<'a> PaintCtx<'a> {
                 hatched_default: self.hatched_default,
                 click_zones: &mut self.view.click_zones,
                 widget_rect: self.rect,
+                texture_cache: &mut self.cache.textures,
             }
             .paint_zone(&BlockZone {
                 layers: &self.view.decorations.layers,
@@ -1212,6 +1241,12 @@ impl<'a> PaintCtx<'a> {
             if let Some(widget) = &seg.widget {
                 let widget = widget.clone();
                 let g_clone = g.clone();
+                // Baseline of the surrounding text in this (possibly grown)
+                // row: the galley is centered with its top at `seg_y`, so the
+                // baseline sits `ascent` below that. An inline pixel widget
+                // (math) is aligned to this same baseline so it sits on the
+                // text's baseline rather than floating or being clipped.
+                let baseline_y = seg_y + galley_ascent(&g_clone, self.view.line_height);
                 self.paint_inline_widget_placeholder(
                     &widget,
                     SegSpan {
@@ -1220,6 +1255,7 @@ impl<'a> PaintCtx<'a> {
                         top_y: line_top_y,
                         height: row_height,
                         label_y: seg_y,
+                        baseline_y,
                     },
                     &g_clone,
                 );
@@ -1251,70 +1287,6 @@ impl<'a> PaintCtx<'a> {
                     Stroke::new(1.0, fg),
                 );
             }
-        }
-    }
-
-    /// v1 placeholder render for an inline widget decoration: a styled rect of
-    /// the widget's measured size plus a tiny "widget" label. Real per-widget
-    /// painting is deferred to a future trait method.
-    fn paint_inline_widget_placeholder(
-        &mut self,
-        widget: &Arc<dyn InlineWidget>,
-        span: SegSpan,
-        label_galley: &Arc<egui::Galley>,
-    ) {
-        let SegSpan { x: seg_x, width: seg_w, top_y: line_top_y, height: row_height, label_y } = span;
-        let visuals = self.ui.style().visuals.clone();
-        let rect = Rect::from_min_max(
-            Pos2::new(seg_x, line_top_y),
-            Pos2::new(seg_x + seg_w, line_top_y + row_height),
-        );
-
-        if let Some(display) = widget.display() {
-            // Textual variant — host wants this widget to read as ordinary
-            // inline text with a colored background (patch-review intraline
-            // insertion, future inline diagnostics, etc.). Skip the bordered
-            // placeholder entirely and just paint a bg fill + the galley.
-            if let Some(bg) = display.bg {
-                self.painter.rect_filled(rect, 0.0, to_egui_color(bg));
-            }
-            let fg = display
-                .fg
-                .map(to_egui_color)
-                .unwrap_or_else(|| visuals.text_color());
-            self.painter
-                .galley(Pos2::new(seg_x, label_y), label_galley.clone(), fg);
-            if display.strikethrough {
-                let mid_y = line_top_y + row_height * 0.5;
-                self.painter.line_segment(
-                    [Pos2::new(seg_x, mid_y), Pos2::new(seg_x + seg_w, mid_y)],
-                    Stroke::new(1.0, fg),
-                );
-            }
-        } else {
-            let bg = if visuals.dark_mode {
-                Color32::from_rgba_unmultiplied(70, 80, 110, 80)
-            } else {
-                Color32::from_rgba_unmultiplied(210, 220, 240, 220)
-            };
-            let border = visuals.weak_text_color().gamma_multiply(0.5);
-            self.painter.rect_filled(rect, 3.0, bg);
-            self.painter
-                .rect_stroke(rect, 3.0, Stroke::new(0.5, border), egui::StrokeKind::Inside);
-            self.painter
-                .galley(Pos2::new(seg_x + 2.0, label_y), label_galley.clone(), border);
-        }
-
-        if widget.handles_click() {
-            self.view.click_zones.push(ClickZone {
-                rect: ClickRect {
-                    x_min: seg_x - self.rect.min.x,
-                    y_min: line_top_y - self.rect.min.y,
-                    x_max: seg_x + seg_w - self.rect.min.x,
-                    y_max: line_top_y + row_height - self.rect.min.y,
-                },
-                action: ClickAction::WidgetClick(widget.widget_id()),
-            });
         }
     }
 

@@ -43,12 +43,30 @@ pub struct Diagnostic {
     pub code: Option<SmolStr>,
 }
 
+/// A borrowed, tightly-packed RGBA8 pixel buffer supplied by a pixel widget.
+///
+/// `rgba` is tightly packed (no row padding) and `len() == width * height * 4`.
+/// Pixels are already scaled to **physical** px: the widget bakes the device
+/// pixel ratio (DPR) in, so the egui adapter blits 1:1 into the reserved rect
+/// without rescaling.
+///
+/// This type is deliberately egui-free — `editor-core` never names a GPU
+/// texture. The egui adapter (`editor-egui`) is the only layer that uploads
+/// these bytes; see slug `widget-painter-texture-blit`.
+pub struct WidgetPixels<'a> {
+    pub rgba: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Data-side trait for inline widgets embedded in a line of text.
 ///
 /// Widgets are introduced as decorations via [`Decoration::InlineWidget`]. The
 /// painter measures the widget at the current font size and reserves an
-/// equivalently-sized region in the line layout. Painting of arbitrary
-/// widgets is deferred — the v1 egui adapter renders a placeholder rect.
+/// equivalently-sized region in the line layout. A widget supplies its visual
+/// either as text (via [`display`](InlineWidget::display)) or as raw pixels
+/// (via [`pixels`](InlineWidget::pixels)); a widget that supplies neither
+/// renders as a bordered placeholder rect.
 pub trait InlineWidget: Send + Sync {
     /// Pixel size when laid out at the given font size.
     fn measure(&self, font_size: f32) -> (f32, f32);
@@ -57,6 +75,12 @@ pub trait InlineWidget: Send + Sync {
         false
     }
     /// Stable identity for diffing; defaults to 0.
+    ///
+    /// This is also the texture-cache key (slug `widget-painter-texture-blit`).
+    /// A widget that supplies [`pixels`](InlineWidget::pixels) MUST return a
+    /// stable, content-derived id (a hash of source + style + size + dpr +
+    /// theme) so the texture cache invalidates whenever the rendered bytes —
+    /// including the widget's size — change.
     fn widget_id(&self) -> u64 {
         0
     }
@@ -70,6 +94,22 @@ pub trait InlineWidget: Send + Sync {
     fn display(&self) -> Option<InlineWidgetDisplay> {
         None
     }
+    /// When `Some`, the inline-widget painter uploads the returned RGBA8 buffer
+    /// to a texture, caches it by [`widget_id`](InlineWidget::widget_id), and
+    /// blits it into the reserved rect (slug `widget-painter-texture-blit`).
+    /// [`display`](InlineWidget::display) takes precedence: a textual widget
+    /// renders as text and never reaches this pixel path. Default `None` keeps
+    /// the placeholder behavior for widgets without pixels.
+    fn pixels(&self) -> Option<WidgetPixels<'_>> {
+        None
+    }
+    /// Distance in physical px from the top of the widget box down to the text
+    /// baseline. Used to vertically align an inline pixel widget (e.g. inline
+    /// math) on the surrounding text's baseline rather than centering it.
+    /// `None` centers the widget in its reserved rect.
+    fn baseline(&self) -> Option<f32> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -80,8 +120,31 @@ pub struct InlineWidgetDisplay {
     pub strikethrough: bool,
 }
 
+/// A clickable sub-region of a block widget, expressed in NORMALIZED widget
+/// coordinates: `x`/`y`/`w`/`h` are fractions in `0.0..1.0` of the widget's
+/// painted box. The painter maps them through the SAME aspect-preserving
+/// letterbox transform it uses to blit the widget's texture, so a region lines
+/// up exactly with what's drawn regardless of scaling or device pixel ratio.
+///
+/// `id` is host-defined and surfaces back as
+/// [`ClickAction::WidgetClick`](../../editor_view/viewport/enum.ClickAction.html)'s
+/// payload when the region is clicked, so the host can map the click to an
+/// action (e.g. the node id of a rendered diagram). Deliberately egui-free —
+/// plain `f32`s only, keeping `editor-core` free of any GPU/UI types.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WidgetClickRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub id: u64,
+}
+
 /// Data-side trait for block widgets injected in the vertical gap above /
-/// below a line. See [`InlineWidget`] for v1 rendering limitations.
+/// below a line. A widget supplies its visual as raw pixels via
+/// [`pixels`](BlockWidget::pixels); a widget without pixels renders as a
+/// colored placeholder rect.
 pub trait BlockWidget: Send + Sync {
     /// Returns the laid-out height (pixels) for the given font size and
     /// available width.
@@ -89,8 +152,34 @@ pub trait BlockWidget: Send + Sync {
     fn handles_click(&self) -> bool {
         false
     }
+    /// Stable identity for diffing; defaults to 0.
+    ///
+    /// This is also the texture-cache key (slug `widget-painter-texture-blit`).
+    /// A widget that supplies [`pixels`](BlockWidget::pixels) MUST return a
+    /// stable, content-derived id (a hash of source + style + size + dpr +
+    /// theme) so the texture cache invalidates whenever the rendered bytes —
+    /// including the widget's size — change.
     fn widget_id(&self) -> u64 {
         0
+    }
+    /// When `Some`, the block-widget painter uploads the returned RGBA8 buffer
+    /// to a texture, caches it by [`widget_id`](BlockWidget::widget_id), and
+    /// blits it into the reserved rect (slug `widget-painter-texture-blit`).
+    /// Default `None` keeps the placeholder behavior for widgets without pixels.
+    fn pixels(&self) -> Option<WidgetPixels<'_>> {
+        None
+    }
+    /// Clickable sub-regions in NORMALIZED widget coords (0.0..1.0 of the
+    /// widget's painted box), each with a host-defined id. Default: none.
+    ///
+    /// Regions are only meaningful for the texture-backed paint path (where
+    /// [`pixels`](BlockWidget::pixels) is `Some`): the painter maps each region
+    /// through the same letterbox transform as the texture and emits a
+    /// per-region [`WidgetClick(id)`] click zone, in addition to the
+    /// whole-widget zone keyed on [`widget_id`](BlockWidget::widget_id). The
+    /// host distinguishes the two by id.
+    fn click_regions(&self) -> Vec<WidgetClickRegion> {
+        Vec::new()
     }
 }
 

@@ -43,6 +43,10 @@ pub(super) struct BlockPaint<'a> {
     pub(super) hatched_default: Color,
     pub(super) click_zones: &'a mut Vec<ClickZone>,
     pub(super) widget_rect: Rect,
+    /// Pixel-widget texture cache (slug `widget-painter-texture-blit`). A block
+    /// widget that supplies `pixels()` blits a cached texture here instead of
+    /// the placeholder rect.
+    pub(super) texture_cache: &'a mut super::texture_cache::TextureCache,
 }
 
 /// Identifies which block zone to paint: the decoration layers to scan,
@@ -106,13 +110,46 @@ impl<'a> BlockPaint<'a> {
         }
     }
 
-    /// v1 placeholder render for a block widget decoration: a colored rect with a
-    /// "widget" label. Real per-widget painting is deferred.
+    /// Render a block widget decoration. A pixel widget (`pixels()` is `Some`)
+    /// blits its cached texture into `rect` (slug `widget-painter-texture-blit`);
+    /// a widget without pixels falls back to a colored rect with a "widget"
+    /// label. A click zone is recorded in either case when the widget handles
+    /// clicks.
     fn paint_block_widget_placeholder(
         &mut self,
         widget: &Arc<dyn BlockWidget>,
         rect: Rect,
     ) {
+        if let Some(pixels) = widget.pixels() {
+            if self
+                .texture_cache
+                .blit(self.ui, widget.widget_id(), &pixels, rect)
+            {
+                if widget.handles_click() {
+                    // The texture is letterboxed inside `rect` (aspect
+                    // preserved, centered). Normalized click regions are
+                    // fractions of that painted box, so map them through the
+                    // SAME transform the blit used.
+                    let painted =
+                        super::texture_cache::letterbox(rect, pixels.width as f32, pixels.height as f32);
+                    for region in widget.click_regions() {
+                        let region_rect = Rect::from_min_max(
+                            Pos2::new(
+                                painted.min.x + region.x * painted.width(),
+                                painted.min.y + region.y * painted.height(),
+                            ),
+                            Pos2::new(
+                                painted.min.x + (region.x + region.w) * painted.width(),
+                                painted.min.y + (region.y + region.h) * painted.height(),
+                            ),
+                        );
+                        self.push_region_click_zone(region_rect, region.id);
+                    }
+                    self.push_widget_click_zone(widget, rect);
+                }
+                return;
+            }
+        }
         let visuals = self.ui.style().visuals.clone();
         let bg = if visuals.dark_mode {
             Color32::from_rgba_unmultiplied(70, 80, 110, 80)
@@ -131,16 +168,30 @@ impl<'a> BlockPaint<'a> {
         self.painter.galley(pos, galley, fg);
 
         if widget.handles_click() {
-            self.click_zones.push(ClickZone {
-                rect: ClickRect {
-                    x_min: rect.min.x - self.widget_rect.min.x,
-                    y_min: rect.min.y - self.widget_rect.min.y,
-                    x_max: rect.max.x - self.widget_rect.min.x,
-                    y_max: rect.max.y - self.widget_rect.min.y,
-                },
-                action: ClickAction::WidgetClick(widget.widget_id()),
-            });
+            self.push_widget_click_zone(widget, rect);
         }
+    }
+
+    /// Record a widget-local click zone over `rect` dispatching to the widget's
+    /// `widget_id`. Shared by the texture-blit and placeholder paths.
+    fn push_widget_click_zone(&mut self, widget: &Arc<dyn BlockWidget>, rect: Rect) {
+        self.push_region_click_zone(rect, widget.widget_id());
+    }
+
+    /// Record a widget-local click zone over `rect` dispatching to `id`. Used
+    /// both for the whole-widget zone (`id == widget_id`) and for each
+    /// sub-region a widget exposes via `click_regions` (`id` host-defined). The
+    /// host distinguishes the two by the id value.
+    fn push_region_click_zone(&mut self, rect: Rect, id: u64) {
+        self.click_zones.push(ClickZone {
+            rect: ClickRect {
+                x_min: rect.min.x - self.widget_rect.min.x,
+                y_min: rect.min.y - self.widget_rect.min.y,
+                x_max: rect.max.x - self.widget_rect.min.x,
+                y_max: rect.max.y - self.widget_rect.min.y,
+            },
+            action: ClickAction::WidgetClick(id),
+        });
     }
 
     fn paint_block_kind(
