@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
 
 use editor_core::decoration::WidgetPixels;
-use egui::{Color32, ColorImage, Rect, TextureHandle, TextureOptions, Ui};
+use egui::{Color32, ColorImage, Painter, Rect, TextureHandle, TextureOptions, Ui};
 
 /// Cache key: the widget's stable id plus its physical pixel size. The size is
 /// part of the key so a re-render at a new size (which a well-behaved widget
@@ -63,12 +63,19 @@ impl TextureCache {
     /// differs from the buffer's. The rect normally already comes from the
     /// widget's `measure`, so letterboxing is a safety net for size drift.
     ///
+    /// `ui` is used only to upload the texture (`ui.ctx().load_texture`); the
+    /// image is *drawn* with the caller-supplied `painter`, which the editor
+    /// clips to its body rect — so a tall/wide diagram is clipped to the editor
+    /// instead of bleeding over the toolbar / into the gutter (the old path drew
+    /// with the unclipped `ui.painter()`).
+    ///
     /// Returns `true` if it painted; `false` if the buffer was malformed
     /// (`rgba.len() != width * height * 4`) so the caller can fall back to a
     /// placeholder. A malformed buffer is never cached.
     pub fn blit(
         &mut self,
         ui: &Ui,
+        painter: &Painter,
         widget_id: u64,
         pixels: &WidgetPixels<'_>,
         rect: Rect,
@@ -101,7 +108,7 @@ impl TextureCache {
             }
         };
         let target = letterbox(rect, pixels.width as f32, pixels.height as f32);
-        ui.painter().image(
+        painter.image(
             handle_id,
             target,
             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),

@@ -141,10 +141,58 @@ pub struct WidgetClickRegion {
     pub id: u64,
 }
 
+/// Horizontal alignment of a positioned text run in a [`BlockPaint::Text`].
+///
+/// `x` in the run is the anchor: `Left` draws the text starting at `x`,
+/// `Center` centers it on `x`, `Right` ends it at `x`. The painter resolves the
+/// run's pixel width itself (it owns the font), so the data side only states
+/// intent. Used by the table widget to honor per-column alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// One retained native-paint primitive: plain geometry + style in **logical
+/// points**, no egui or GPU types. A [`BlockWidget`] returns a list of these
+/// from [`paint_list`](BlockWidget::paint_list) and the `editor-egui` painter
+/// replays them into the widget's reserved rect (translating point coords to
+/// screen). Coordinates are relative to the widget box's top-left.
+///
+/// This is the egui-free half of the `widget-block-native-paint` hook: the data
+/// side describes *what* to draw (it cannot name a `Painter`), the host decides
+/// *how*. Mirrors the discipline of [`WidgetPixels`] / [`WidgetClickRegion`] /
+/// [`BlockTextLine`]. Used by tables (`widget-table-render`); generic enough
+/// that any later structured native-painted block reuses it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BlockPaint {
+    /// A filled rectangle (header / cell backgrounds).
+    Rect { x: f32, y: f32, w: f32, h: f32, color: Color },
+    /// A straight line (grid rules, cell borders). `width` is the stroke width
+    /// in logical points.
+    Line { from: (f32, f32), to: (f32, f32), width: f32, color: Color },
+    /// A positioned text run. `(x, y)` is the top-left anchor of the line box
+    /// (the painter vertically lays the glyph baseline within it); `align`
+    /// resolves `x` against the run's painter-measured width. `font_scale` is a
+    /// multiplier on the widget's base font size (1.0 == body size).
+    Text {
+        x: f32,
+        y: f32,
+        text: SmolStr,
+        color: Color,
+        font_scale: f32,
+        align: TextAlign,
+    },
+}
+
 /// Data-side trait for block widgets injected in the vertical gap above /
-/// below a line. A widget supplies its visual as raw pixels via
-/// [`pixels`](BlockWidget::pixels); a widget without pixels renders as a
-/// colored placeholder rect.
+/// below a line. A widget supplies its visual either as a retained native-paint
+/// list via [`paint_list`](BlockWidget::paint_list) (replayed by the host with
+/// no texture — used by tables) or as raw pixels via
+/// [`pixels`](BlockWidget::pixels); a widget without either renders as a colored
+/// placeholder rect.
 pub trait BlockWidget: Send + Sync {
     /// Returns the laid-out height (pixels) for the given font size and
     /// available width.
@@ -162,23 +210,47 @@ pub trait BlockWidget: Send + Sync {
     fn widget_id(&self) -> u64 {
         0
     }
+    /// When `Some`, the host replays the returned [`BlockPaint`] primitives
+    /// natively into the widget's reserved rect — no texture, no raster
+    /// (slug `widget-block-native-paint`). Takes precedence over
+    /// [`pixels`](BlockWidget::pixels): a widget that supplies a paint list is
+    /// drawn from it directly. `font_size` is the editor body font size and
+    /// `width` the available widget width (both logical points), matching
+    /// [`measure`](BlockWidget::measure) so the list and the reserved height
+    /// agree. Default `None` keeps the texture / placeholder behavior.
+    ///
+    /// Used by the table widget; the hook is generic, so any structured
+    /// native-painted block reuses it.
+    fn paint_list(&self, font_size: f32, width: f32) -> Option<Vec<BlockPaint>> {
+        let _ = (font_size, width);
+        None
+    }
     /// When `Some`, the block-widget painter uploads the returned RGBA8 buffer
     /// to a texture, caches it by [`widget_id`](BlockWidget::widget_id), and
     /// blits it into the reserved rect (slug `widget-painter-texture-blit`).
+    /// [`paint_list`](BlockWidget::paint_list) takes precedence when present.
     /// Default `None` keeps the placeholder behavior for widgets without pixels.
     fn pixels(&self) -> Option<WidgetPixels<'_>> {
         None
     }
     /// Clickable sub-regions in NORMALIZED widget coords (0.0..1.0 of the
     /// widget's painted box), each with a host-defined id. Default: none.
+    /// `font_size` and `width` are the same layout inputs passed to
+    /// [`measure`](BlockWidget::measure) / [`paint_list`](BlockWidget::paint_list),
+    /// so a widget whose sub-regions depend on its laid-out geometry (e.g. a
+    /// table's per-cell rects) can compute them; widgets with resolution-
+    /// independent regions (e.g. a diagram's normalized hit-boxes) ignore them.
     ///
-    /// Regions are only meaningful for the texture-backed paint path (where
-    /// [`pixels`](BlockWidget::pixels) is `Some`): the painter maps each region
-    /// through the same letterbox transform as the texture and emits a
-    /// per-region [`WidgetClick(id)`] click zone, in addition to the
-    /// whole-widget zone keyed on [`widget_id`](BlockWidget::widget_id). The
-    /// host distinguishes the two by id.
-    fn click_regions(&self) -> Vec<WidgetClickRegion> {
+    /// Regions fire on BOTH paint paths. On the texture path
+    /// ([`pixels`](BlockWidget::pixels) is `Some`) the painter maps each region
+    /// through the same letterbox transform as the texture; on the native path
+    /// ([`paint_list`](BlockWidget::paint_list) is `Some`) it maps them linearly
+    /// into the painted box (no letterbox). Either way it emits a per-region
+    /// [`WidgetClick(id)`] click zone in addition to the whole-widget zone keyed
+    /// on [`widget_id`](BlockWidget::widget_id); the host distinguishes the two
+    /// by id.
+    fn click_regions(&self, font_size: f32, width: f32) -> Vec<WidgetClickRegion> {
+        let _ = (font_size, width);
         Vec::new()
     }
 }
@@ -279,9 +351,10 @@ pub enum Decoration {
         /// for cursor motion (equivalent to `MarkStyle { atomic: true }`).
         atomic: bool,
     },
-    /// Trait-object block widget. v1 limitation: rendered as a colored
-    /// placeholder rect in the block zone; the trait's painting hook is
-    /// deferred to a future revision.
+    /// Trait-object block widget. The painter draws it from the widget's
+    /// retained native-paint list ([`BlockWidget::paint_list`],
+    /// slug `widget-block-native-paint`) when present, else blits its texture
+    /// ([`BlockWidget::pixels`]), else falls back to a colored placeholder rect.
     BlockWidget {
         side: BlockSide,
         widget: Arc<dyn BlockWidget>,

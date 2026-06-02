@@ -28,6 +28,66 @@ mod inline_paint;
 pub(crate) mod layout;
 mod search_panel;
 pub mod texture_cache;
+
+/// Env-gated (`EDITOR_PROF=1`) per-phase timer for `show()`. Prints mean µs per
+/// phase to stderr every 120 frames; zero cost when off.
+mod phase_prof {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static ON: AtomicU8 = AtomicU8::new(0);
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => {
+                let on = std::env::var_os("EDITOR_PROF").is_some();
+                ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+    #[allow(clippy::type_complexity)]
+    fn state() -> &'static Mutex<(HashMap<&'static str, (f64, u32)>, u32)> {
+        static S: OnceLock<Mutex<(HashMap<&'static str, (f64, u32)>, u32)>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new((HashMap::new(), 0)))
+    }
+    /// Count a frame; every 120, print the per-phase means and reset.
+    pub(crate) fn frame() {
+        if !enabled() {
+            return;
+        }
+        let mut s = state().lock().unwrap();
+        s.1 += 1;
+        if s.1 >= 120 {
+            let mut v: Vec<_> = s.0.drain().collect();
+            s.1 = 0;
+            drop(s);
+            v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            let mut line = String::from("[editor-prof]");
+            let total: f64 = v.iter().map(|(_, (sum, c))| sum / (*c).max(1) as f64).sum();
+            for (k, (sum, c)) in &v {
+                line.push_str(&format!("  {k} {:.0}us", sum / (*c).max(1) as f64));
+            }
+            eprintln!("{line}   (sum {total:.0}us)");
+        }
+    }
+    pub(crate) fn start() -> Option<Instant> {
+        enabled().then(Instant::now)
+    }
+    pub(crate) fn record(name: &'static str, t: Option<Instant>) {
+        if let Some(t) = t {
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            if let Ok(mut s) = state().lock() {
+                let e = s.0.entry(name).or_insert((0.0, 0));
+                e.0 += us;
+                e.1 += 1;
+            }
+        }
+    }
+}
 use blocks::{BlockPaint, BlockZone};
 use inline_paint::{galley_ascent, SegSpan};
 use layout::{LineLayout, LineLayoutBuilder, LineMeasured};
@@ -137,6 +197,15 @@ pub struct Widget<'a> {
     /// blocks blink. When this hook is set, the widget treats decorations as
     /// current (no stale-frame height deferral).
     pub decoration_rebuild: Option<DecorationRebuild<'a>>,
+    /// Whether the widget participates in pointer / keyboard input. Default
+    /// `true`. When `false` the widget allocates a non-interacting (hover-only)
+    /// response and skips the entire input phase — it never takes focus and
+    /// never processes clicks / drags / keys / scroll, so it can be hosted as a
+    /// pure display surface underneath another widget that owns the pointer
+    /// (the canvas interaction surface). It still measures, lays out, paints,
+    /// and runs the decoration / widget pipeline, so a read-only card renders
+    /// identically to an interactive one.
+    pub interactive: bool,
 }
 
 /// Host hook invoked between input and paint to rebuild decoration layers
@@ -152,7 +221,17 @@ impl<'a> Widget<'a> {
             transactions_out: None,
             paint_cache: None,
             decoration_rebuild: None,
+            interactive: true,
         }
+    }
+
+    /// Set whether the widget participates in pointer / keyboard input (default
+    /// `true`). Passing `false` makes it a pure display surface — see
+    /// [`Widget::interactive`].
+    #[must_use]
+    pub const fn interactive(mut self, on: bool) -> Self {
+        self.interactive = on;
+        self
     }
 
     /// Set the post-input decoration-rebuild hook (see
@@ -191,9 +270,12 @@ impl<'a> Widget<'a> {
     }
 
     pub fn show(mut self, ui: &mut egui::Ui) -> egui::Response {
-        // Phase 0: layout — claim screen space and compute the text rect.
+        // Phase 0: layout — claim screen space and compute the text rect. A
+        // non-interactive widget allocates a hover-only response so it never
+        // takes focus or steals click / drag from a host surface above it.
         let desired = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
+        let sense = if self.interactive { Sense::click_and_drag() } else { Sense::hover() };
+        let (rect, response) = ui.allocate_exact_size(desired, sense);
         self.sync_search_panel();
         let (top_h, bottom_h) = self.view.panels.heights();
         let text_rect = Rect::from_min_max(
@@ -203,7 +285,10 @@ impl<'a> Widget<'a> {
 
         // Phase 1: update — pull frame inputs onto ViewState (size, fonts),
         // run input events, and capture what changed.
+        let _pp = phase_prof::frame();
+        let _t = phase_prof::start();
         let mut update = self.update(ui, &response, rect, text_rect);
+        phase_prof::record("update", _t);
 
         // Phase 1.5: let the host rebuild its decoration layers against the
         // doc as it stands AFTER this frame's input. This is what keeps live
@@ -212,6 +297,7 @@ impl<'a> Widget<'a> {
         // line up with the text being painted. Re-read the height fingerprint
         // afterward (the rebuild changed the layers) and mark decorations
         // fresh so `measure` derives heights this frame instead of deferring.
+        let _t = phase_prof::start();
         let decorations_refreshed = if let Some(rebuild) = self.decoration_rebuild.take() {
             rebuild(self.state, self.view);
             update.height_decos = self.view.decorations.height_signature;
@@ -219,6 +305,7 @@ impl<'a> Widget<'a> {
         } else {
             false
         };
+        phase_prof::record("deco_rebuild", _t);
 
         // Phase 2: measure — heightmap + wrap recompute. Skipped entirely
         // when no input that affects geometry has changed. Returns true when
@@ -228,7 +315,9 @@ impl<'a> Widget<'a> {
         // immediate repaint so the host rebuilds decorations against the new
         // doc and the geometry settles on the very next frame rather than
         // waiting on the idle 500 ms repaint (which would read as a flicker).
+        let _t = phase_prof::start();
         let needs_relayout = self.measure(update, decorations_refreshed);
+        phase_prof::record("measure", _t);
 
         // An edit this frame asked the caret be scrolled back into view. Apply
         // it now that the height map reflects the post-edit doc — but only when
@@ -257,7 +346,9 @@ impl<'a> Widget<'a> {
             Some(c) => c,
             None => &mut fallback_cache,
         };
+        let _t = phase_prof::start();
         self.paint(ui, cache, text_rect, has_focus);
+        phase_prof::record("paint", _t);
         self.paint_cache = host_cache;
         if needs_relayout {
             ui.ctx().request_repaint();
@@ -294,6 +385,20 @@ impl<'a> Widget<'a> {
         // Snapshot the inputs that drove last frame's measure. We compare
         // against the post-input values below.
         let pre_doc_id = self.state.doc.content_id() as u64;
+
+        // Non-interactive (display-only) widget: the screen metrics above are
+        // all the measure / paint phases need, so skip the entire input phase —
+        // no focus, no pointer / key / scroll handling. The host surface above
+        // owns the pointer. Selection, caret, and scroll stay exactly as the
+        // host set them.
+        if !self.interactive {
+            return ViewUpdate {
+                pre_doc_id,
+                doc_id: pre_doc_id,
+                metrics: compute_metrics_fingerprint(self.view),
+                height_decos: self.view.decorations.height_signature,
+            };
+        }
 
         // Grant focus on any pointer press, not just a completed click —
         // a press that becomes a drag never fires `clicked()`, so without
@@ -444,7 +549,9 @@ impl<'a> Widget<'a> {
         // in a list (which empties/shifts a visible line) then sliced the now-
         // empty line with the old range and panicked.
         self.view.wrap_map.ensure_capacity(self.state.doc.len_lines());
+        let _t = phase_prof::start();
         self.prewrap_visible();
+        phase_prof::record("  m.prewrap", _t);
 
         if stale {
             // Heights derive from the host's decoration layers, which still
@@ -462,9 +569,21 @@ impl<'a> Widget<'a> {
             return true;
         }
 
-        // Decorations are current: derive heights from them.
-        self.view.sync_to(self.state);
-        self.apply_line_height_decorations();
+        // Heights derive from the doc, the (full-doc) height decoration layers,
+        // and line metrics — none of which change when the user merely scrolls.
+        // `apply_line_height_decorations` rebuilds the entire height map, so doing
+        // it on every viewport shift burns ~2ms/frame on long files for nothing.
+        // Re-derive only when one of those inputs actually changed; on a pure
+        // scroll the stateful height map from the last derivation still holds.
+        // (Viewport-scoped decoration layers are routed paint-only and never feed
+        // the heightmap driver, so they can't make heights viewport-dependent.)
+        let heights_dirty = metrics_changed || doc_changed || decos_changed;
+        if heights_dirty {
+            let _t = phase_prof::start();
+            self.view.sync_to(self.state);
+            self.apply_line_height_decorations();
+            phase_prof::record("  m.height", _t);
+        }
 
         // Viewport may have shifted as a result of the geometry rebuild
         // (heights changing under us). Re-read for the cache snapshot.
@@ -579,7 +698,12 @@ fn apply_line_height_decorations(&mut self) {
                 }
                 Decoration::BlockWidget { side, widget } => {
                     let line = state.doc.byte_to_line(range.start.min(doc_len));
-                    let h = widget.measure(view.font_size, view.width);
+                    // Pass the CONTENT width (text column, gutter excluded) —
+                    // the same box `paint_block_widget_placeholder` letterboxes
+                    // into — so a widget that scales to fit width reserves a
+                    // matching height (no excess vertical band).
+                    let content_w = (view.width - view.content_origin_x()).max(0.0);
+                    let h = widget.measure(view.font_size, content_w);
                     match side {
                         BlockSide::Above => view.height_map.add_block_above(line, h),
                         BlockSide::Below => view.height_map.add_block_below(line, h),

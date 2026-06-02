@@ -1,15 +1,18 @@
-//! Mermaid code-block detection + decorations.
+//! Diagram code-block detection + decorations (Mermaid, WaveDrom).
 //!
-//! Detects fenced code blocks tagged ```` ```mermaid ````. The raw span scan
-//! ([`mermaid_spans`]) is the renderer-facing API: it reports the fence's byte
-//! range + the inner diagram source so the `app` layer can render each block to
-//! a `BlockWidget` (`widget-mermaid-render`). This crate stays renderer-unaware
-//! — it never depends on `hiker-render` or egui.
+//! Detects fenced code blocks tagged ```` ```mermaid ```` and ```` ```wavedrom
+//! ````. The raw span scans ([`mermaid_spans`] / [`wavedrom_spans`]) are the
+//! renderer-facing API: each reports the fence's byte range + the inner diagram
+//! source so the `app` layer can render the block to a `BlockWidget`
+//! (`widget-mermaid-render`, `widget-wavedrom-render`). This crate stays
+//! renderer-unaware — it never depends on `hiker-render` or egui. Both diagram
+//! kinds share one language-parameterized fence scan ([`scan_fences`]).
 //!
-//! [`mermaid_decorations`] is the cursor-in / render-off fallback: it consumes
-//! the same fence scan and applies a tinted per-line background across the
-//! entire block (including the fence lines), so users see where their mermaid
-//! blocks live when the rendered widget is suppressed.
+//! [`mermaid_decorations`] / [`wavedrom_decorations`] are the cursor-in /
+//! render-off fallback: they consume the same fence scan and apply a tinted
+//! per-line background across the entire block (including the fence lines), so
+//! users see where their diagram blocks live when the rendered widget is
+//! suppressed.
 
 use editor_core::decoration::Color;
 
@@ -23,6 +26,7 @@ use editor_core::rangeset::RangeSet;
 
 use editor_core::theme::Theme;
 pub const COLOR_MERMAID_BG: Color = Color::rgba(120, 200, 180, 28);
+pub const COLOR_WAVEDROM_BG: Color = Color::rgba(200, 170, 120, 28);
 
 /// A detected ```` ```mermaid ```` fenced block: the full source byte range
 /// (fence lines inclusive) and the inner range (the diagram source between the
@@ -37,22 +41,33 @@ pub struct MermaidSpan {
     pub inner_range: std::ops::Range<usize>,
 }
 
-/// One scanned ```` ```mermaid ```` fence: the open/close *line* indices
-/// (`close_line` is the matching close fence, or the last document line when
-/// the fence is unterminated). Both `mermaid_spans` and `mermaid_decorations`
-/// build from this single line-level scan so fence-parsing lives in one place.
-struct MermaidFence {
+/// A detected ```` ```wavedrom ```` fenced block — same shape as [`MermaidSpan`]
+/// (full byte range + inner WaveJSON source range). The renderer-facing output
+/// for the WaveDrom widget (`widget-wavedrom-render`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaveDromSpan {
+    pub byte_range: std::ops::Range<usize>,
+    pub inner_range: std::ops::Range<usize>,
+}
+
+/// One scanned diagram fence: the open/close *line* indices (`close_line` is the
+/// matching close fence, or the last document line when the fence is
+/// unterminated). The `*_spans` and `*_decorations` builders all share this
+/// single language-parameterized line-level scan so fence-parsing lives in one
+/// place.
+struct Fence {
     open_line: usize,
     close_line: usize,
 }
 
-/// Whether `line_text` opens a ```` ```mermaid ```` fence.
-fn is_mermaid_fence_open(line_text: &str) -> bool {
+/// Whether `line_text` opens a ```` ```<lang> ```` fence for `lang`
+/// (case-insensitive, info string matched exactly after the triple-backtick).
+fn is_lang_fence_open(line_text: &str, lang: &str) -> bool {
     let trimmed = line_text.trim_start();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return false;
     };
-    rest.trim().eq_ignore_ascii_case("mermaid")
+    rest.trim().eq_ignore_ascii_case(lang)
 }
 
 /// Whether `line_text` is a bare closing fence (``` ``` ``` with no info string).
@@ -64,14 +79,15 @@ fn is_fence_close(line_text: &str) -> bool {
     rest.trim().is_empty()
 }
 
-/// Scan `state` (viewport-scoped) for ```` ```mermaid ```` fenced blocks,
+/// Scan `state` (viewport-scoped) for ```` ```<lang> ```` fenced blocks,
 /// returning each fence's open/close line indices. The close fence is searched
 /// across the whole document (not just the viewport) so a block that opens
 /// on-screen but closes below the fold is still detected.
 fn scan_fences(
     state: &EditorState,
     viewport: Option<&std::ops::Range<usize>>,
-) -> Vec<MermaidFence> {
+    lang: &str,
+) -> Vec<Fence> {
     let text = state.doc.to_string();
     let total_lines = state.doc.len_lines();
     let doc_len = state.doc.len_bytes();
@@ -97,7 +113,7 @@ fn scan_fences(
     let mut fences = Vec::new();
     let mut line = line_range.start;
     while line < scan_end_line {
-        if is_mermaid_fence_open(line_str(line)) {
+        if is_lang_fence_open(line_str(line), lang) {
             let open_line = line;
             let mut close_line = open_line;
             let mut found_close = false;
@@ -113,7 +129,7 @@ fn scan_fences(
             if !found_close {
                 close_line = total_lines.saturating_sub(1);
             }
-            fences.push(MermaidFence { open_line, close_line });
+            fences.push(Fence { open_line, close_line });
             line = close_line + 1;
             continue;
         }
@@ -122,13 +138,15 @@ fn scan_fences(
     fences
 }
 
-/// Scan the document (viewport-scoped) for ```` ```mermaid ```` fenced blocks,
-/// reporting each fence's byte range and the inner diagram source range so the
-/// `app` layer can render it to a `BlockWidget`. status: widget-mermaid-render
-pub fn mermaid_spans(
+/// Scan the document (viewport-scoped) for ```` ```<lang> ```` fenced blocks,
+/// reporting each as `(byte_range, inner_range)`: the full fence byte range and
+/// the inner diagram source range (lines between the open and close fences).
+/// Shared by [`mermaid_spans`] / [`wavedrom_spans`].
+fn fence_spans(
     state: &EditorState,
     viewport: Option<&std::ops::Range<usize>>,
-) -> Vec<MermaidSpan> {
+    lang: &str,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
     let total_lines = state.doc.len_lines();
     let doc_len = state.doc.len_bytes();
     let line_byte_end = |line: usize| -> usize {
@@ -138,7 +156,7 @@ pub fn mermaid_spans(
             doc_len
         }
     };
-    scan_fences(state, viewport)
+    scan_fences(state, viewport, lang)
         .into_iter()
         .map(|f| {
             let block_start = state.doc.line_to_byte(f.open_line);
@@ -152,24 +170,46 @@ pub fn mermaid_spans(
             } else {
                 inner_start
             };
-            MermaidSpan {
-                byte_range: block_start..block_end,
-                inner_range: inner_start..inner_end.max(inner_start),
-            }
+            (block_start..block_end, inner_start..inner_end.max(inner_start))
         })
         .collect()
 }
 
-/// Tinted-source fallback view: a per-line background tint across the whole
-/// fenced block (fence lines inclusive). Used when rendering is off
-/// (`widget-render-toggle`) or the cursor is inside the span
-/// (`widget-reveal-block`).
-pub fn mermaid_decorations(
+/// Scan the document (viewport-scoped) for ```` ```mermaid ```` fenced blocks,
+/// reporting each fence's byte range and the inner diagram source range so the
+/// `app` layer can render it to a `BlockWidget`. status: widget-mermaid-render
+pub fn mermaid_spans(
     state: &EditorState,
-    theme: Option<&Theme>,
     viewport: Option<&std::ops::Range<usize>>,
+) -> Vec<MermaidSpan> {
+    fence_spans(state, viewport, "mermaid")
+        .into_iter()
+        .map(|(byte_range, inner_range)| MermaidSpan { byte_range, inner_range })
+        .collect()
+}
+
+/// Scan the document (viewport-scoped) for ```` ```wavedrom ```` fenced blocks,
+/// reporting each fence's byte range and the inner WaveJSON source range so the
+/// `app` layer can render it to a `BlockWidget`. status: widget-wavedrom-render
+pub fn wavedrom_spans(
+    state: &EditorState,
+    viewport: Option<&std::ops::Range<usize>>,
+) -> Vec<WaveDromSpan> {
+    fence_spans(state, viewport, "wavedrom")
+        .into_iter()
+        .map(|(byte_range, inner_range)| WaveDromSpan { byte_range, inner_range })
+        .collect()
+}
+
+/// Tinted-source fallback view for a diagram `lang`: a per-line background tint
+/// across the whole fenced block (fence lines inclusive). Shared by
+/// [`mermaid_decorations`] / [`wavedrom_decorations`].
+fn diagram_decorations(
+    state: &EditorState,
+    viewport: Option<&std::ops::Range<usize>>,
+    lang: &str,
+    bg: Color,
 ) -> DecorationSet {
-    let bg = theme.map(|t| t.markdown.code_bg).unwrap_or(COLOR_MERMAID_BG);
     let total_lines = state.doc.len_lines();
     let doc_len = state.doc.len_bytes();
     let line_byte_end = |line: usize| -> usize {
@@ -181,7 +221,7 @@ pub fn mermaid_decorations(
     };
 
     let mut entries: Vec<(std::ops::Range<usize>, Decoration)> = Vec::new();
-    for fence in scan_fences(state, viewport) {
+    for fence in scan_fences(state, viewport, lang) {
         for l in fence.open_line..=fence.close_line {
             if l >= total_lines {
                 break;
@@ -199,6 +239,30 @@ pub fn mermaid_decorations(
     }
 
     RangeSet::from_iter(entries)
+}
+
+/// Tinted-source fallback view: a per-line background tint across the whole
+/// ```` ```mermaid ```` block (fence lines inclusive). Used when rendering is
+/// off (`widget-render-toggle`) or the cursor is inside the span
+/// (`widget-reveal-block`).
+pub fn mermaid_decorations(
+    state: &EditorState,
+    theme: Option<&Theme>,
+    viewport: Option<&std::ops::Range<usize>>,
+) -> DecorationSet {
+    let bg = theme.map(|t| t.markdown.code_bg).unwrap_or(COLOR_MERMAID_BG);
+    diagram_decorations(state, viewport, "mermaid", bg)
+}
+
+/// Tinted-source fallback view for ```` ```wavedrom ```` blocks, mirroring
+/// [`mermaid_decorations`]. status: widget-wavedrom-render
+pub fn wavedrom_decorations(
+    state: &EditorState,
+    theme: Option<&Theme>,
+    viewport: Option<&std::ops::Range<usize>>,
+) -> DecorationSet {
+    let bg = theme.map(|t| t.markdown.code_bg).unwrap_or(COLOR_WAVEDROM_BG);
+    diagram_decorations(state, viewport, "wavedrom", bg)
 }
 
 #[cfg(test)]
@@ -238,5 +302,42 @@ mod tests {
         let src = "```rust\nfn main() {}\n```\n";
         let state = EditorState::new(src);
         assert!(mermaid_spans(&state, None).is_empty(), "rust fence is not mermaid");
+    }
+
+    #[test]
+    fn detects_wavedrom_fence_span() {
+        let src = "intro\n\n```wavedrom\n{ signal: [{ name: 'clk', wave: 'p..' }] }\n```\n\nmore\n";
+        let state = EditorState::new(src);
+        let spans = wavedrom_spans(&state, None);
+        assert_eq!(spans.len(), 1, "one wavedrom block");
+        let span = &spans[0];
+        assert!(src[span.byte_range.clone()].starts_with("```wavedrom"));
+        assert_eq!(
+            &src[span.inner_range.clone()],
+            "{ signal: [{ name: 'clk', wave: 'p..' }] }\n"
+        );
+    }
+
+    #[test]
+    fn wavedrom_and_mermaid_dont_cross_detect() {
+        let src = "```mermaid\ngraph TD; A-->B\n```\n\n```wavedrom\n{ signal: [] }\n```\n";
+        let state = EditorState::new(src);
+        assert_eq!(mermaid_spans(&state, None).len(), 1, "only the mermaid fence");
+        assert_eq!(wavedrom_spans(&state, None).len(), 1, "only the wavedrom fence");
+    }
+
+    #[test]
+    fn unterminated_wavedrom_fence_still_reports_a_span() {
+        let src = "```wavedrom\n{ signal: [] }\n";
+        let state = EditorState::new(src);
+        assert_eq!(wavedrom_spans(&state, None).len(), 1, "unterminated still reports");
+    }
+
+    #[test]
+    fn wavedrom_decorations_emitted() {
+        let src = "```wavedrom\n{ signal: [] }\n```\n";
+        let state = EditorState::new(src);
+        let set = wavedrom_decorations(&state, None, None);
+        assert!(set.iter_all().count() > 0, "wavedrom block tint emitted");
     }
 }

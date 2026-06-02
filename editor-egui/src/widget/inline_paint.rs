@@ -154,7 +154,7 @@ impl PaintCtx<'_> {
         };
         self.cache
             .textures
-            .blit(self.ui, widget.widget_id(), &pixels, target)
+            .blit(self.ui, &self.painter, widget.widget_id(), &pixels, target)
     }
 }
 

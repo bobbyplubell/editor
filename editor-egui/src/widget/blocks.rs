@@ -17,11 +17,15 @@ use editor_core::decoration::BlockSide;
 
 use editor_core::decoration::BlockTextLine;
 
+use editor_core::decoration::BlockPaint as CorePaint;
+
 use editor_core::decoration::BlockWidget;
 
 use editor_core::decoration::Color;
 
 use editor_core::decoration::Decoration;
+
+use editor_core::decoration::TextAlign;
 use editor_view::viewport::ClickAction;
 use editor_view::viewport::ClickRect;
 use editor_view::viewport::ClickZone;
@@ -110,29 +114,71 @@ impl<'a> BlockPaint<'a> {
         }
     }
 
-    /// Render a block widget decoration. A pixel widget (`pixels()` is `Some`)
-    /// blits its cached texture into `rect` (slug `widget-painter-texture-blit`);
-    /// a widget without pixels falls back to a colored rect with a "widget"
-    /// label. A click zone is recorded in either case when the widget handles
+    /// Render a block widget decoration. Precedence (slug
+    /// `widget-block-native-paint`): a widget that supplies a retained
+    /// native-paint list (`paint_list()` is `Some`) is replayed primitive by
+    /// primitive into `rect` with the host painter, no texture; else a pixel
+    /// widget (`pixels()` is `Some`) blits its cached texture
+    /// (`widget-painter-texture-blit`); else it falls back to a colored rect
+    /// with a "widget" label. A click zone is recorded when the widget handles
     /// clicks.
     fn paint_block_widget_placeholder(
         &mut self,
         widget: &Arc<dyn BlockWidget>,
         rect: Rect,
     ) {
+        let content_w = (rect.max.x - self.text_origin_x).max(0.0);
+        if let Some(list) = widget.paint_list(self.font_size, content_w) {
+            self.paint_native(&list, rect);
+            if widget.handles_click() {
+                // Sub-region (e.g. per-cell) zones first so a cell click wins
+                // over the whole-widget fallback. Native paint fills the content
+                // box 1:1 (no letterbox), so normalized regions map linearly
+                // into it: origin `text_origin_x`, width `content_w`, height
+                // `rect.height()`.
+                for region in widget.click_regions(self.font_size, content_w) {
+                    let region_rect = Rect::from_min_max(
+                        Pos2::new(
+                            self.text_origin_x + region.x * content_w,
+                            rect.min.y + region.y * rect.height(),
+                        ),
+                        Pos2::new(
+                            self.text_origin_x + (region.x + region.w) * content_w,
+                            rect.min.y + (region.y + region.h) * rect.height(),
+                        ),
+                    );
+                    self.push_region_click_zone(region_rect, region.id);
+                }
+                self.push_widget_click_zone(widget, rect);
+            }
+            return;
+        }
         if let Some(pixels) = widget.pixels() {
+            // Letterbox into the CONTENT box (text column), not the full row
+            // rect: the full rect spans the line-number gutter, so centering a
+            // wide diagram there pushed it into the gutter. Sharing the
+            // native-paint origin (`text_origin_x`) also aligns rasterized
+            // diagrams with the prose column. The blit draws via the editor's
+            // clipped painter so it can't bleed over the toolbar.
+            let content_box = Rect::from_min_max(
+                Pos2::new(self.text_origin_x, rect.min.y),
+                Pos2::new(rect.max.x, rect.max.y),
+            );
             if self
                 .texture_cache
-                .blit(self.ui, widget.widget_id(), &pixels, rect)
+                .blit(self.ui, self.painter, widget.widget_id(), &pixels, content_box)
             {
                 if widget.handles_click() {
-                    // The texture is letterboxed inside `rect` (aspect
+                    // The texture is letterboxed inside `content_box` (aspect
                     // preserved, centered). Normalized click regions are
                     // fractions of that painted box, so map them through the
                     // SAME transform the blit used.
-                    let painted =
-                        super::texture_cache::letterbox(rect, pixels.width as f32, pixels.height as f32);
-                    for region in widget.click_regions() {
+                    let painted = super::texture_cache::letterbox(
+                        content_box,
+                        pixels.width as f32,
+                        pixels.height as f32,
+                    );
+                    for region in widget.click_regions(self.font_size, content_box.width()) {
                         let region_rect = Rect::from_min_max(
                             Pos2::new(
                                 painted.min.x + region.x * painted.width(),
@@ -169,6 +215,55 @@ impl<'a> BlockPaint<'a> {
 
         if widget.handles_click() {
             self.push_widget_click_zone(widget, rect);
+        }
+    }
+
+    /// Replay a widget's retained native-paint list into `rect` (slug
+    /// `widget-block-native-paint`). Each [`CorePaint`] primitive carries
+    /// logical-point coordinates relative to the widget box's top-left. The box
+    /// top-left is the text content origin — `(text_origin_x, rect.min.y)`, NOT
+    /// `rect.min` — so the widget aligns with the prose column rather than the
+    /// line-number gutter (the same `text_origin_x` offset `paint_block_text`
+    /// uses). We translate each primitive by that origin and draw with the host
+    /// painter — filled rects, line strokes, and font-laid text runs (the same
+    /// galley idiom `paint_block_text` / `paint_action_row` use). No texture is
+    /// uploaded; the table widget paints this way.
+    fn paint_native(&self, list: &[CorePaint], rect: Rect) {
+        let origin = Pos2::new(self.text_origin_x, rect.min.y);
+        for prim in list {
+            match prim {
+                CorePaint::Rect { x, y, w, h, color } => {
+                    let r = Rect::from_min_max(
+                        Pos2::new(origin.x + x, origin.y + y),
+                        Pos2::new(origin.x + x + w, origin.y + y + h),
+                    );
+                    self.painter.rect_filled(r, 0.0, to_egui_color(*color));
+                }
+                CorePaint::Line { from, to, width, color } => {
+                    self.painter.line_segment(
+                        [
+                            Pos2::new(origin.x + from.0, origin.y + from.1),
+                            Pos2::new(origin.x + to.0, origin.y + to.1),
+                        ],
+                        Stroke::new(*width, to_egui_color(*color)),
+                    );
+                }
+                CorePaint::Text { x, y, text, color, font_scale, align } => {
+                    let fg = to_egui_color(*color);
+                    let font_id =
+                        FontId::new(self.font_size * font_scale, FontFamily::Proportional);
+                    let galley =
+                        self.ui.fonts(|f| f.layout_no_wrap(text.to_string(), font_id, fg));
+                    let anchor_x = origin.x + x;
+                    let left_x = match align {
+                        TextAlign::Left => anchor_x,
+                        TextAlign::Center => anchor_x - galley.size().x * 0.5,
+                        TextAlign::Right => anchor_x - galley.size().x,
+                    };
+                    self.painter
+                        .galley(Pos2::new(left_x, origin.y + y), galley, fg);
+                }
+            }
         }
     }
 

@@ -10,6 +10,7 @@ pub mod meta;
 pub mod indenter;
 pub mod equations;
 pub mod diagrams;
+pub mod tables;
 pub mod embeds;
 pub mod links;
 pub mod syntax;

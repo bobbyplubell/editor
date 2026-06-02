@@ -47,7 +47,7 @@ impl BlockWidget for DiagramWidget {
     fn pixels(&self) -> Option<WidgetPixels<'_>> {
         Some(WidgetPixels { rgba: &self.rgba, width: self.w, height: self.h })
     }
-    fn click_regions(&self) -> Vec<WidgetClickRegion> {
+    fn click_regions(&self, _font_size: f32, _width: f32) -> Vec<WidgetClickRegion> {
         if !self.with_regions {
             return Vec::new();
         }
@@ -112,14 +112,23 @@ fn emits_region_zones_plus_whole_widget_zone() {
     let whole = region_zone(&view, WIDGET_ID).expect("whole-widget zone missing");
 
     // The painted (letterboxed) box: a 40x40 square fit into the block zone.
-    // The block zone spans the full widget width (400) and is 80px tall, so the
-    // texture scales to 80x80 and centers horizontally. The whole-widget zone
-    // covers the FULL block rect (not the letterboxed box), so its bounds
-    // contain the painted box.
+    // The texture letterboxes into the CONTENT box (text column, gutter
+    // excluded), not the full row, so a diagram clears the line-number gutter.
+    // The zone is 80px tall, so the square scales to 80x80, centered
+    // horizontally in the content box and vertically in the full block zone.
+    // The whole-widget zone covers the FULL block rect, so it contains the box.
     let painted_w = 80.0;
     let painted_h = 80.0;
-    let painted_x_min = whole.rect.x_min + (whole.rect.x_max - whole.rect.x_min - painted_w) * 0.5;
+    let content_x_min = whole.rect.x_min + view.content_origin_x();
+    let content_w = whole.rect.x_max - content_x_min;
+    let painted_x_min = content_x_min + (content_w - painted_w) * 0.5;
     let painted_y_min = whole.rect.y_min + (whole.rect.y_max - whole.rect.y_min - painted_h) * 0.5;
+    // Regression: the painted box starts right of the gutter (it used to center
+    // in the full row, spilling into the gutter on a wide diagram).
+    assert!(
+        painted_x_min > whole.rect.x_min + 0.5,
+        "diagram must clear the line-number gutter"
+    );
 
     // Region A is the top-left quadrant of the painted box.
     assert!((za.rect.x_min - painted_x_min).abs() < 0.5, "A x_min off");

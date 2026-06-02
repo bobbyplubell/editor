@@ -109,6 +109,19 @@ impl<'a> MdScan<'a> {
         self.cursor_line >= start_line && self.cursor_line <= end_line
     }
 
+    /// True if any non-empty selection range overlaps `range`. Block elements
+    /// (code fences) extend the cursor-line reveal to per-block reveal on
+    /// selection: highlighting a block reveals its delimiters even when the
+    /// caret head lands outside the block's lines (`live-preview-selection-
+    /// reveal-all`, `live-preview-code-fence-block-reveal`). Empty selections
+    /// are the bare cursor, already covered by `on_cursor_line`.
+    fn selection_intersects(&self, range: &std::ops::Range<usize>) -> bool {
+        self.state.selection.ranges().iter().any(|r| {
+            let (s, e) = (r.start(), r.end());
+            s != e && s < range.end && e > range.start
+        })
+    }
+
     const fn in_frontmatter(&self, r: &std::ops::Range<usize>) -> bool {
         match &self.frontmatter_range {
             Some(fm) => r.start < fm.end && r.end > fm.start,
@@ -452,7 +465,14 @@ impl<'a> MdScan<'a> {
     }
 
     fn style_fenced_code_block(&mut self, range: &std::ops::Range<usize>, lang: &str) {
-        let block_active = self.on_cursor_line(range.clone());
+        // Per-block reveal: the cursor anywhere inside the block, OR a selection
+        // overlapping it, keeps the fence delimiters visible. Without the
+        // selection check, highlighting a block (caret head landing past the
+        // closing fence) collapsed the ` ```lang ` / ` ``` ` lines even though
+        // the diagram/widget layer revealed the body (`live-preview-code-fence-
+        // block-reveal`, `live-preview-selection-reveal-all`).
+        let block_active =
+            self.on_cursor_line(range.clone()) || self.selection_intersects(range);
         let line_starts = self.collect_line_starts(range);
         let pal = self.pal;
         let mut body_start: Option<usize> = None;
@@ -816,7 +836,42 @@ fn read_line_at(text: &str, line_start: usize) -> &str {
 mod tests {
     use super::*;
     use editor_core::decoration::Decoration;
+    use editor_core::selection::{SelRange, Selection};
     use editor_core::state::Editor as EditorState;
+
+    /// Count `Line` decorations that hide their line (`hide: true`).
+    fn hidden_lines(set: &DecorationSet) -> usize {
+        set.iter_all()
+            .filter(|(_, d)| matches!(d, Decoration::Line(l) if l.hide))
+            .count()
+    }
+
+    #[test]
+    fn selecting_code_fence_reveals_delimiters() {
+        // Regression (`live-preview-code-fence-block-reveal` +
+        // `live-preview-selection-reveal-all`): highlighting a fenced block with
+        // the caret head landing *past* the closing fence must keep the
+        // ` ```lang ` / ` ``` ` delimiter lines visible — the bug collapsed them.
+        let src = "intro\n\n```mermaid\ngraph TD; A-->B\n```\n\nmore\n";
+        let mut state = EditorState::new(src);
+
+        // Caret at offset 0 → block inactive → both fence delimiters hidden.
+        assert!(
+            hidden_lines(&markdown_decorations(&state, None)) >= 2,
+            "fence delimiters hidden when the caret is away"
+        );
+
+        // Highlight the whole block; the head lands on the `more` line (outside
+        // the block's lines), which used to collapse the fences.
+        let start = src.find("```mermaid").unwrap();
+        let head = src.find("more").unwrap();
+        state.selection = Selection::from_range(SelRange::new(start, head));
+        assert_eq!(
+            hidden_lines(&markdown_decorations(&state, None)),
+            0,
+            "selecting the block reveals its fence delimiters"
+        );
+    }
 
     /// Run the markdown decoration pass over `src` with the cursor at the very
     /// start of the document (so off-line suppression applies to later lines).

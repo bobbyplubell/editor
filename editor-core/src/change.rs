@@ -161,7 +161,7 @@ impl Set {
     pub fn map_pos(&self, pos: usize, bias: Bias) -> usize {
         let mut in_pos = 0usize;
         let mut out_pos = 0usize;
-        for op in &self.ops {
+        for (i, op) in self.ops.iter().enumerate() {
             match op {
                 Op::Retain(n) => {
                     let n = *n as usize;
@@ -174,6 +174,23 @@ impl Set {
                 Op::Delete(n) => {
                     let n = *n as usize;
                     if pos < in_pos + n {
+                        // A position STRICTLY inside the deleted region collapses
+                        // to the deletion point. A position exactly at the START
+                        // of the deletion with `Right` bias must ride to the far
+                        // side of the change — past an immediately-following
+                        // `Insert` (a replace, e.g. typing over a selection).
+                        // Without this, the replaced range's anchor sticks to the
+                        // left of the inserted text while its head lands to the
+                        // right, so the new text stays *selected* and the next
+                        // keystroke replaces it again ("each letter replaces the
+                        // last"). The delete is emitted before its paired insert,
+                        // so this boundary case never reaches the `Insert` arm.
+                        if pos == in_pos && matches!(bias, Bias::Right) {
+                            return match self.ops.get(i + 1) {
+                                Some(Op::Insert(s)) => out_pos + s.len(),
+                                _ => out_pos,
+                            };
+                        }
                         return out_pos;
                     }
                     in_pos += n;
@@ -385,6 +402,27 @@ mod tests {
         assert_eq!(c.map_pos(5, Bias::Right), 3); // inside deletion
         assert_eq!(c.map_pos(7, Bias::Right), 3);
         assert_eq!(c.map_pos(10, Bias::Right), 6);
+    }
+
+    #[test]
+    fn map_pos_through_replace_collapses_selection() {
+        // Replace [3,7) with "XY" (delete-then-insert change set). Mapping the
+        // selection that produced the replace must COLLAPSE to a caret after the
+        // inserted text — otherwise the new text stays selected and the next
+        // keystroke replaces it ("each letter replaces the last").
+        let c = cs(10, &[(3..7, "XY")]);
+        // Anchor at the start of the replaced range (Right bias) rides PAST the
+        // insert to its far side; head at the end lands at the same spot.
+        assert_eq!(c.map_pos(3, Bias::Right), 5, "anchor maps past the insert");
+        assert_eq!(c.map_pos(7, Bias::Right), 5, "head maps to the same point");
+        // Left bias at the start stays before the insert (e.g. a backward range's
+        // head); a position strictly inside still collapses to the delete point.
+        assert_eq!(c.map_pos(3, Bias::Left), 3);
+        assert_eq!(c.map_pos(5, Bias::Right), 3, "inside the replaced range");
+        // Single-char replace (the reported case: type over a 1-char selection).
+        let one = cs(10, &[(4..5, "z")]);
+        assert_eq!(one.map_pos(4, Bias::Right), 5);
+        assert_eq!(one.map_pos(5, Bias::Right), 5);
     }
 
     #[test]
