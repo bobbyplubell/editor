@@ -553,6 +553,16 @@ pub struct HeightMap {
     /// mutations.
     prefix_index: Vec<PrefixEntry>,
     prefix_dirty: bool,
+    /// Per-line soft-wrap visual-row count the height multiplier was last
+    /// applied with (only lines with >1 visual row are stored; absence means
+    /// 1). The wrap cache is refreshed for the visible band every frame, but
+    /// the height map is only re-derived on a doc / metrics / height-decoration
+    /// change — so a line whose wrap count flips when a viewport-scoped
+    /// decoration covers it on scroll-in would otherwise keep a stale row
+    /// allocation. The widget's measure pass compares the live wrap count of
+    /// each visible line against this and forces a re-derive on a mismatch, so
+    /// the painter never stacks more (or fewer) visual rows than were reserved.
+    wrap_counts: std::collections::BTreeMap<usize, u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -583,6 +593,7 @@ impl HeightMap {
             // measure pass re-emit (which it will — sync is followed by
             // apply_line_height_decorations every measure).
             self.overrides.clear();
+            self.wrap_counts.clear();
             self.total = (line_count as f32) * default_height;
             self.prefix_index.clear();
             self.prefix_dirty = false;
@@ -712,6 +723,9 @@ impl HeightMap {
     /// re-apply only the heights it actually needs without first walking
     /// every line.
     pub fn reset_text_heights(&mut self) {
+        // The soft-wrap multiplier is re-applied fresh after this reset, so the
+        // recorded counts are rebuilt from scratch each derivation.
+        self.wrap_counts.clear();
         if self.overrides.is_empty() {
             return;
         }
@@ -777,6 +791,28 @@ impl HeightMap {
             .get(&line)
             .and_then(|o| o.text_height)
             .unwrap_or(self.default_height)
+    }
+
+    /// Record the soft-wrap visual-row count the height multiplier was applied
+    /// to `line` with. Stored only for genuinely wrapped lines (`vc > 1`); a
+    /// reset back to 1 drops the entry. Called by the widget's heightmap driver
+    /// right where it multiplies the row height. See [`Self::wrap_count`].
+    pub fn set_wrap_count(&mut self, line: usize, vc: usize) {
+        if vc > 1 {
+            self.wrap_counts.insert(line, vc as u32);
+        } else {
+            self.wrap_counts.remove(&line);
+        }
+    }
+
+    /// The soft-wrap visual-row count the height map currently reserves space
+    /// for at `line` (1 when the line isn't wrapped). The widget compares this
+    /// against the live wrap cache for each visible line to detect a line whose
+    /// wrap changed since the last derivation (e.g. a viewport-scoped
+    /// decoration covering it on scroll-in), which would otherwise leave a
+    /// stale row allocation.
+    pub fn wrap_count(&self, line: usize) -> usize {
+        self.wrap_counts.get(&line).map_or(1, |&c| c as usize)
     }
 
     /// Recompute the cached prefix index. Idempotent — safe to call multiple

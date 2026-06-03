@@ -93,6 +93,26 @@ use inline_paint::{galley_ascent, SegSpan};
 use layout::{LineLayout, LineLayoutBuilder, LineMeasured};
 use texture_cache::TextureCache;
 
+/// The two signals [`Widget::measure`] reports back to `show`.
+#[derive(Clone, Copy)]
+struct MeasureOutcome {
+    /// The height re-derivation was deferred because the host's decoration
+    /// layers are stale (an edit landed this frame, before the host rebuilt
+    /// them) — see [`Widget::decorations_stale`]. The caret-into-view scroll is
+    /// held a frame while this is set, since the geometry isn't current yet.
+    stale: bool,
+    /// Force a repaint after this frame so geometry that depends on a value
+    /// only known *after* this frame settles on the next one (a stale-deferred
+    /// re-derivation, or a wrap-driven re-derive whose `visible_lines` was
+    /// computed against the pre-derivation height map).
+    needs_repaint: bool,
+}
+
+impl MeasureOutcome {
+    /// Nothing changed this frame: no deferral, no repaint needed.
+    const IDLE: Self = Self { stale: false, needs_repaint: false };
+}
+
 /// Per-frame snapshot of the inputs that feed the measure pass. Compared
 /// against `ViewState::measure_cache` to decide whether geometry needs to be
 /// rebuilt.
@@ -316,15 +336,15 @@ impl<'a> Widget<'a> {
         // doc and the geometry settles on the very next frame rather than
         // waiting on the idle 500 ms repaint (which would read as a flicker).
         let _t = phase_prof::start();
-        let needs_relayout = self.measure(update, decorations_refreshed);
+        let measured = self.measure(update, decorations_refreshed);
         phase_prof::record("measure", _t);
 
         // An edit this frame asked the caret be scrolled back into view. Apply
         // it now that the height map reflects the post-edit doc — but only when
-        // measure didn't defer (`needs_relayout`); on a deferred frame the
-        // geometry is still stale, so keep the flag and let the forced repaint
-        // below settle it next frame.
-        if self.view.scroll_caret_into_view && !needs_relayout {
+        // measure didn't defer (`stale`); on a deferred frame the geometry is
+        // still stale, so keep the flag and let the forced repaint below settle
+        // it next frame.
+        if self.view.scroll_caret_into_view && !measured.stale {
             command::scroll_caret_into_view(self.state, self.view);
             self.view.scroll_caret_into_view = false;
         }
@@ -350,7 +370,7 @@ impl<'a> Widget<'a> {
         self.paint(ui, cache, text_rect, has_focus);
         phase_prof::record("paint", _t);
         self.paint_cache = host_cache;
-        if needs_relayout {
+        if measured.needs_repaint {
             ui.ctx().request_repaint();
         }
         crate::tooltip::paint_tooltips(ui, self.view, self.state, text_rect);
@@ -495,11 +515,9 @@ impl<'a> Widget<'a> {
     }
 
     /// Phase 2: rebuild the heightmap + wrap cache only when needed. Reads
-    /// `view.measure_cache` to detect a no-op; updates it on a real pass.
-    ///
-    /// Returns `true` when it deferred the height re-derivation because the
-    /// host's decoration layers are stale — see [`Self::decorations_stale`].
-    fn measure(&mut self, update: ViewUpdate, decorations_refreshed: bool) -> bool {
+    /// `view.measure_cache` to detect a no-op; updates it on a real pass. See
+    /// [`MeasureOutcome`] for the two signals it returns.
+    fn measure(&mut self, update: ViewUpdate, decorations_refreshed: bool) -> MeasureOutcome {
         let cache = self.view.measure_cache;
         let metrics_changed = cache.metrics != update.metrics;
         let doc_changed = cache.doc_id != update.doc_id;
@@ -511,7 +529,7 @@ impl<'a> Widget<'a> {
         let viewport_changed = (viewport.start, viewport.end) != cache.viewport;
 
         if !(metrics_changed || doc_changed || decos_changed || viewport_changed) {
-            return false;
+            return MeasureOutcome::IDLE;
         }
 
         // The host rebuilds its decoration layers ONCE per frame, before the
@@ -553,6 +571,20 @@ impl<'a> Widget<'a> {
         self.prewrap_visible();
         phase_prof::record("  m.prewrap", _t);
 
+        // Did any visible line's wrap geometry change since the last height
+        // derivation? `prewrap_visible` (above) keeps the wrap cache current for
+        // the visible band every frame, but a viewport-scoped `Replace`/`Mark`
+        // decoration (wikilink hide, inline-math substitution, …) only covers a
+        // line once it scrolls into view — so a line's `visual_count` can flip
+        // on scroll-in even though doc / metrics / height-decoration signatures
+        // are all unchanged. The height map's per-line soft-wrap multiplier was
+        // baked at the last derivation (recorded via `set_wrap_count`); if a
+        // visible line's live wrap count no longer matches, the painter would
+        // stack a different number of visual rows than the row reserves
+        // (overlapping or gapped text). Treat that as a height-affecting change
+        // so the map is rebuilt to match.
+        let wrap_changed = self.visible_wrap_mismatch();
+
         if stale {
             // Heights derive from the host's decoration layers, which still
             // describe the pre-edit doc this frame. Don't wipe overrides via a
@@ -566,18 +598,23 @@ impl<'a> Widget<'a> {
             // Deliberately leave `measure_cache` unchanged so the next frame
             // (fresh decorations) still sees doc_id / height_decos as changed
             // and performs the real re-derivation.
-            return true;
+            return MeasureOutcome { stale: true, needs_repaint: true };
         }
 
         // Heights derive from the doc, the (full-doc) height decoration layers,
-        // and line metrics — none of which change when the user merely scrolls.
+        // line metrics, and each line's soft-wrap row count.
         // `apply_line_height_decorations` rebuilds the entire height map, so doing
         // it on every viewport shift burns ~2ms/frame on long files for nothing.
         // Re-derive only when one of those inputs actually changed; on a pure
         // scroll the stateful height map from the last derivation still holds.
-        // (Viewport-scoped decoration layers are routed paint-only and never feed
-        // the heightmap driver, so they can't make heights viewport-dependent.)
-        let heights_dirty = metrics_changed || doc_changed || decos_changed;
+        // Viewport-scoped decoration layers don't feed the heightmap driver
+        // directly, but they CAN change a line's wrap count when they begin
+        // covering it on scroll-in (a `Replace` shifts where it breaks) — and
+        // the wrap count feeds the height multiplier. `wrap_changed` catches
+        // exactly that case (a visible line's live wrap no longer matches the
+        // count the map reserved), so heights track wrap even though the doc /
+        // metrics / decoration signatures are all unchanged.
+        let heights_dirty = metrics_changed || doc_changed || decos_changed || wrap_changed;
         if heights_dirty {
             let _t = phase_prof::start();
             self.view.sync_to(self.state);
@@ -594,7 +631,36 @@ impl<'a> Widget<'a> {
             metrics: update.metrics,
             viewport: (viewport.start, viewport.end),
         };
-        false
+        // A wrap-driven re-derive needs one settle frame: when a card opens
+        // already scrolled, frame 1's height derivation runs with an as-yet-
+        // empty height map (so `visible_lines` reported the top of the doc and
+        // the host scoped its viewport decorations there); the corrected
+        // geometry only lands once this frame's heights make `visible_lines`
+        // accurate. Request that repaint so it converges without waiting on an
+        // external input. It settles in one frame — re-running the (idempotent)
+        // derivation records matching wrap counts, so the next frame sees no
+        // mismatch and stops repainting.
+        MeasureOutcome { stale: false, needs_repaint: wrap_changed && heights_dirty }
+    }
+
+    /// Whether any currently-visible line's live soft-wrap row count differs
+    /// from the count the height map reserved for it at the last derivation
+    /// (recorded via [`HeightMap::set_wrap_count`]). This catches a line whose
+    /// wrap flipped when a viewport-scoped decoration began covering it on
+    /// scroll-in — the one geometry input that changes without touching the
+    /// doc / metrics / height-decoration signatures. Comparing against the
+    /// baked count (rather than last frame's visible set) means a line newly
+    /// entering the viewport is checked too, not just lines already on screen.
+    /// O(visible lines); only runs on a frame that already passed the
+    /// measure-cache gate.
+    fn visible_wrap_mismatch(&self) -> bool {
+        if !self.view.wrap_map.enabled() {
+            return false;
+        }
+        self.view.visible_lines().any(|line| {
+            let live = self.view.wrap_map.peek(line).map_or(1, |w| w.visual_count());
+            live != self.view.height_map.wrap_count(line)
+        })
     }
 
     /// True when an edit was applied during this frame's input handling, so
@@ -741,6 +807,10 @@ fn apply_line_height_decorations(&mut self) {
                     let h = view.height_map.text_height(line);
                     if h > 0.0 {
                         view.height_map.set_line_height(line, h * vc as f32);
+                        // Record the row count this allocation was built for, so
+                        // measure can detect a later viewport-scoped wrap change
+                        // on this line (scroll-in reveal) and re-derive.
+                        view.height_map.set_wrap_count(line, vc);
                     }
                 }
             }
