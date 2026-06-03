@@ -188,16 +188,56 @@ impl Editor {
 
     /// Convenience: insert text at every selection range, replacing the
     /// selected text. Returns a transaction (does not apply).
+    ///
+    /// The resulting selection is set *explicitly* — one collapsed point cursor
+    /// just after each inserted run — rather than left to the bias-driven
+    /// `Selection::map`. Typing over a selection must always land the caret to
+    /// the RIGHT of the new text, but a *reversed* selection (anchor > head,
+    /// e.g. from dragging or shift-selecting upward/leftward) carries
+    /// `Bias::Left` on the range start, so mapping it through the replace would
+    /// collapse the caret to the LEFT of the insert — leaving the new text
+    /// selected so the next keystroke replaces it again. That surfaced as
+    /// right-to-left typing ("edit" → "tide") with a stuck caret on multi-line
+    /// replaces. Computing the post-insert offsets here makes the caret
+    /// orientation-independent, matching CodeMirror's selection-from-change
+    /// discipline.
     pub fn insert_at_selections(&self, text: &str) -> Transaction {
-        let mut edits: Vec<(std::ops::Range<usize>, String)> = self
+        // Pair each edit with the index of the selection range it came from, so
+        // the post-insert caret order can be re-keyed back to the original main
+        // range after sorting (multi-cursor edits in document order).
+        let mut edits: Vec<(usize, std::ops::Range<usize>, String)> = self
             .selection
             .ranges()
             .iter()
-            .map(|r| (r.range(), text.to_string()))
+            .enumerate()
+            .map(|(i, r)| (i, r.range(), text.to_string()))
             .collect();
-        edits.sort_by_key(|(r, _)| r.start);
-        let changes = Set::of(self.doc.len_bytes(), edits);
-        Transaction::new(changes).with_edit_type(EditType::Input)
+        edits.sort_by_key(|(_, r, _)| r.start);
+        let main_orig = self.selection.main_index();
+        let main_sorted = edits
+            .iter()
+            .position(|(i, _, _)| *i == main_orig)
+            .unwrap_or(0);
+
+        // Walk the (sorted, non-overlapping) edits, accumulating the net byte
+        // shift each preceding edit applies, to land each caret just past the
+        // text it inserted: new_caret = range.start + shift_so_far + text.len().
+        let mut new_ranges: Vec<crate::selection::SelRange> = Vec::with_capacity(edits.len());
+        let mut shift: isize = 0;
+        for (_, range, ins) in &edits {
+            let caret = (range.start as isize + shift) as usize + ins.len();
+            new_ranges.push(crate::selection::SelRange::point(caret));
+            shift += ins.len() as isize - (range.end - range.start) as isize;
+        }
+        let new_sel = crate::selection::Selection::from_ranges(new_ranges, main_sorted);
+
+        let changes = Set::of(
+            self.doc.len_bytes(),
+            edits.into_iter().map(|(_, r, t)| (r, t)),
+        );
+        Transaction::new(changes)
+            .with_selection(new_sel)
+            .with_edit_type(EditType::Input)
     }
 
     /// Convenience: delete the selection at every range; if empty, delete the
