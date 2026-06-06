@@ -83,10 +83,24 @@ pub fn autopair_skip(
     )
 }
 
-/// True when the character immediately to the right of `cursor` is
-/// non-whitespace. Used to suppress auto-close when wrapping/typing before
-/// existing text (the bare cursor-at-end / cursor-before-whitespace case still
-/// auto-closes). Document end counts as "no text to the right".
+/// A closing bracket that should NOT block auto-pairing when it sits
+/// immediately to the right of the cursor. Typing an opener just before one of
+/// these is the nested-pair case — `[[` → `[[]]`, `((` → `(())`, `{[` inside
+/// `[]` → `[{}]` — where we want the new pair, not a lone opener. Quote chars
+/// (`"`, `` ` ``) are intentionally excluded: a quote is its own closer, and
+/// typing one right before an auto-inserted quote is handled by the
+/// skip-over-close path (`autopair_skip`), not by pairing again.
+const fn is_close_bracket(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
+}
+
+/// True when the character immediately to the right of `cursor` blocks
+/// auto-close: non-whitespace text that isn't itself a closing bracket. Used to
+/// suppress auto-close when wrapping/typing before existing word text (the bare
+/// cursor-at-end / cursor-before-whitespace case still auto-closes). A closing
+/// bracket to the right does NOT block, so typing a second opener inside a
+/// fresh pair nests it (`[[` → `[[]]`) rather than dropping a lone opener
+/// (`[[]`). Document end counts as "no text to the right".
 fn has_text_to_right(state: &EditorState, cursor: usize) -> bool {
     let doc = &state.doc;
     if cursor >= doc.len_bytes() {
@@ -97,7 +111,7 @@ fn has_text_to_right(state: &EditorState, cursor: usize) -> bool {
         .to_string()
         .chars()
         .next()
-        .is_some_and(|c| !c.is_whitespace())
+        .is_some_and(|c| !c.is_whitespace() && !is_close_bracket(c))
 }
 
 /// If `inserted` is a single auto-pair opener and every selection range is

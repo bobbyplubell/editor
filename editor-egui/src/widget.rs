@@ -370,7 +370,12 @@ impl<'a> Widget<'a> {
         self.paint(ui, cache, text_rect, has_focus);
         phase_prof::record("paint", _t);
         self.paint_cache = host_cache;
-        if measured.needs_repaint {
+        // Force another frame while a selection drag is autoscrolling at a
+        // viewport edge: egui only repaints on input, so without this the scroll
+        // would freeze the instant the pointer stops moving even though the user
+        // is still holding the button at the edge. The held `Drag` event the
+        // translate layer emits each frame then advances the scroll + selection.
+        if measured.needs_repaint || self.view.autoscroll_active {
             ui.ctx().request_repaint();
         }
         crate::tooltip::paint_tooltips(ui, self.view, self.state, text_rect);
@@ -1358,7 +1363,13 @@ impl<'a> PaintCtx<'a> {
                 self.painter.rect_filled(sel, 0.0, self.selection_color);
             }
             if e > line_byte_end && line_idx + 1 < self.state.doc.len_lines() {
-                let x_end = measured.total_width;
+                // The trailing-newline indicator butts against the end of the
+                // line's TEXT. An empty line carries a placeholder " " segment
+                // (so it keeps a caret/click extent), which inflates
+                // `total_width` to one space — anchoring the indicator there
+                // floats it a character in from the margin. Pin it to x=0 on an
+                // empty line so the highlight sits flush-left like the text rows.
+                let x_end = if line_text_len == 0 { 0.0 } else { measured.total_width };
                 let extra = Rect::from_min_max(
                     Pos2::new(self.text_origin_x + x_end, line_top_y),
                     Pos2::new(self.text_origin_x + x_end + self.view.font_size * 0.5, line_top_y + row_height),

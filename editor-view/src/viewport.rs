@@ -248,6 +248,14 @@ pub struct ViewState {
     pub decorations: DecorationLayers,
     /// Current mouse-drag state machine. See [`DragState`].
     pub drag: DragState,
+    /// Set each frame by the selection-drag autoscroll (`selection-autoscroll`)
+    /// when the pointer sits in / past a vertical edge band and the view is
+    /// still able to scroll. The egui adapter reads it to keep requesting
+    /// frames while the pointer is held still at the edge — without that the
+    /// scroll would stall the moment the mouse stops moving (egui only repaints
+    /// on input). Cleared when the pointer leaves the band, the scroll clamps at
+    /// either end, or the drag ends.
+    pub autoscroll_active: bool,
     /// Last interaction; for cursor blinking.
     pub last_interaction: Instant,
     /// Set by `command::handle` when an edit moved the caret; consumed by the
@@ -382,6 +390,7 @@ impl Default for ViewState {
             ime: ImeState::default(),
             decorations: DecorationLayers::default(),
             drag: DragState::Idle,
+            autoscroll_active: false,
             last_interaction: Instant::now(),
             scroll_caret_into_view: false,
             read_only: false,

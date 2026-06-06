@@ -4,6 +4,8 @@
 //! The widget itself doesn't know about diff — it just renders Block, Mark,
 //! and Line decorations. This crate is the "consumer" that produces them.
 
+pub mod conflict;
+pub mod overlay;
 pub mod view;
 
 use editor_core::diff::lines as diff_lines;

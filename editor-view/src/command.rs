@@ -1014,6 +1014,10 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
     match view.drag {
         DragState::MaybeSelecting { lo, hi } => {
             view.touch();
+            // Scroll first so a drag held at (or past) a viewport edge keeps
+            // revealing lines; `view_to_buffer` then maps the pointer against
+            // the updated `scroll_y`, extending the head onto the new line.
+            apply_selection_autoscroll(view, y);
             let head = view_to_buffer(state, view, x, y);
             // Union the anchored range with the pointer: while the pointer
             // stays within [lo, hi] the selection is exactly that range (so a
@@ -1047,6 +1051,9 @@ fn mouse_drag(&mut self, x: f32, y: f32) -> Action {
         }
         DragState::RectangleSelecting { start_xy } => {
             view.touch();
+            // Same edge autoscroll as the linear case, before the y→line lookups
+            // below read `scroll_y`, so a column selection can grow off-screen.
+            apply_selection_autoscroll(view, y);
             // Build a multi-range Selection covering one SelRange per buffer
             // line intersecting the vertical span `[start_xy.1, y]`, each
             // spanning from x→byte(min_x) to x→byte(max_x) on its own line.
@@ -1208,6 +1215,8 @@ fn mouse_up(&mut self, x: f32, y: f32) -> Action {
     let view = &mut *self.view;
     let prev = view.drag;
     view.drag = DragState::Idle;
+    // The drag is over — stop any edge autoscroll repaint loop.
+    view.autoscroll_active = false;
     match prev {
         DragState::DraggingSelection { drop_caret } => {
             // Apply a text drag: remove the main selection range and
@@ -1269,6 +1278,75 @@ fn pattern_span_at(text: &str, local: usize, re: &regex::Regex) -> Option<(usize
 fn scroll_by(view: &mut ViewState, delta_y: f32) {
     view.scroll_y = (view.scroll_y - delta_y).max(0.0);
     clamp_scroll(view);
+}
+
+/// Selection-drag autoscroll tuning. A trigger band `AUTOSCROLL_MARGIN_LINES`
+/// line-heights tall sits at the top and bottom of the viewport (clamped so it
+/// never eats more than a third of a short viewport). While a selection drag's
+/// pointer is inside — or past — a band, the view scrolls so the selection can
+/// extend beyond what's on screen. Speed ramps with how far the pointer is past
+/// the band's inner edge, raised to `AUTOSCROLL_EXP` (superlinear, so it stays
+/// slow and precise just inside the band and accelerates as the pointer pushes
+/// toward and beyond the viewport edge), scaled so it reaches `AUTOSCROLL_GAIN`
+/// lines/frame exactly at the viewport edge, and capped at `AUTOSCROLL_MAX_LINES`
+/// lines/frame. Everything is expressed in line-heights so the feel is the same
+/// at any font size / DPI. status: selection-autoscroll
+const AUTOSCROLL_MARGIN_LINES: f32 = 1.0;
+const AUTOSCROLL_EXP: f32 = 1.5;
+const AUTOSCROLL_GAIN: f32 = 0.5;
+const AUTOSCROLL_MAX_LINES: f32 = 1.25;
+
+/// Vertical autoscroll speed (pixels this frame) for a selection drag whose
+/// pointer is at widget-local `y`. Returns `0.0` when the pointer is in the
+/// central dead zone; a negative value scrolls toward the document start (the
+/// pointer is near / above the top edge) and a positive value toward the end
+/// (near / below the bottom edge). The pointer may sit outside the viewport
+/// entirely (`y < 0` or `y > height`), which simply increases the distance —
+/// and so the speed — up to the cap. See the `AUTOSCROLL_*` constants for the
+/// curve. status: selection-autoscroll
+pub fn selection_autoscroll_velocity(view: &ViewState, y: f32) -> f32 {
+    if view.height <= 0.0 {
+        return 0.0;
+    }
+    let lh = view.line_height.max(1.0);
+    let margin = (lh * AUTOSCROLL_MARGIN_LINES).min(view.height / 3.0);
+    if margin <= 0.0 {
+        return 0.0;
+    }
+    // Distance the pointer is past a band's inner edge: negative toward the top,
+    // positive toward the bottom, zero in the dead zone between the bands.
+    let dist = if y < margin {
+        y - margin
+    } else if y > view.height - margin {
+        y - (view.height - margin)
+    } else {
+        return 0.0;
+    };
+    // Normalize by the margin so the ramp's shape is font-size independent: it is
+    // 0 at the band's inner edge and 1 at the viewport edge, growing past 1 when
+    // the pointer leaves the viewport.
+    let over = (dist.abs() / margin).powf(AUTOSCROLL_EXP);
+    let lines = (over * AUTOSCROLL_GAIN).min(AUTOSCROLL_MAX_LINES);
+    (lines * lh).copysign(dist)
+}
+
+/// Apply one frame of selection-drag autoscroll for a pointer at widget-local
+/// `y`, updating `view.scroll_y` (clamped) and `view.autoscroll_active`. The
+/// caller maps the pointer to a buffer position *after* this runs, so the
+/// selection head follows the freshly revealed lines. `autoscroll_active` is set
+/// only while the scroll actually moves — once clamped at either end there is
+/// nothing left to reveal, so the egui adapter can stop forcing repaints.
+/// status: selection-autoscroll
+fn apply_selection_autoscroll(view: &mut ViewState, y: f32) {
+    let v = selection_autoscroll_velocity(view, y);
+    if v == 0.0 {
+        view.autoscroll_active = false;
+        return;
+    }
+    let before = view.scroll_y;
+    view.scroll_y += v;
+    clamp_scroll(view);
+    view.autoscroll_active = view.scroll_y != before;
 }
 
 /// Clamp `scroll_y` to `[0, total - height + scroll_past_end*height]`. Shared
@@ -1337,6 +1415,14 @@ pub fn view_to_buffer(state: &EditorState, view: &ViewState, x: f32, y: f32) -> 
     } else {
         (0, line_text.len())
     };
+    // Clamp to the live line bytes: `wrap_map` can momentarily lag the buffer
+    // (a document swap / content reset rebuilds the text before the wrap map is
+    // recomputed), so a stale vline range can point past the now-shorter — or
+    // empty — `line_text`. A pointer→byte map must never panic on that race; an
+    // out-of-range row collapses to the line end. status: editor-pointer-map
+    let len = line_text.len();
+    let vline_start_byte = vline_start_byte.min(len);
+    let vline_end_byte = vline_end_byte.clamp(vline_start_byte, len);
     let vline_text = &line_text[vline_start_byte..vline_end_byte];
 
     let col_x = (x - view.content_origin_x()).max(0.0);

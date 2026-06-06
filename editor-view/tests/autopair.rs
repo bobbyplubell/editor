@@ -144,6 +144,48 @@ fn backtick_autocloses_at_document_end() {
 }
 
 #[test]
+fn typing_opener_before_a_closing_bracket_nests_the_pair() {
+    // Cursor inside a fresh `[]` (just before the `]`): typing a second `[`
+    // must NEST, producing `[[]]` with the cursor between the inner pair — not
+    // fall through to a lone-opener insert (`[[]`). A closing bracket to the
+    // right is the nested-pair signal, not "text to the right". This is the
+    // `[[` wikilink-open case.
+    let mut state = EditorState::new("[]");
+    state.selection = Selection::single(1);
+    let tx = autopair_transform(&state, "[").expect("nesting opener should auto-close");
+    let new_state = state.apply(tx);
+    assert_eq!(new_state.doc.to_string(), "[[]]");
+    assert_eq!(new_state.selection.main().start(), 2, "cursor between the inner pair");
+}
+
+#[test]
+fn nesting_works_for_every_bracket_pair() {
+    // `(`, `[`, `{` all nest when typed before any closing bracket.
+    for open in ['(', '[', '{'] {
+        for close in [')', ']', '}'] {
+            let mut state = EditorState::new(&close.to_string());
+            state.selection = Selection::single(0);
+            assert!(
+                autopair_transform(&state, &open.to_string()).is_some(),
+                "typing {open} before {close} should nest, not suppress",
+            );
+        }
+    }
+}
+
+#[test]
+fn opener_still_suppressed_before_word_text() {
+    // A word char to the right still blocks auto-close (wrap-before-text), so
+    // the closing-bracket exception is narrow.
+    let mut state = EditorState::new("word");
+    state.selection = Selection::single(0);
+    assert!(
+        autopair_transform(&state, "[").is_none(),
+        "a word char to the right still suppresses auto-close",
+    );
+}
+
+#[test]
 fn autoclose_suppressed_for_all_pairs_with_text_to_right() {
     for pair in DEFAULT_PAIRS {
         let mut state = EditorState::new("x");

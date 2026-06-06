@@ -36,6 +36,8 @@ application would be built on.
 - Double-click selects word; triple-click selects line.
 - Keyboard selection (shift+arrow, shift+word, shift+line, shift+page).
 - Selection survives edits (anchors stay attached to logical positions).
+- Drag-selecting past the top/bottom edge autoscrolls the view so the selection
+  can extend beyond the visible region (§9.24).
 
 ### 2.3 Multi-cursor
 - Add cursor at click point with Ctrl/Cmd-click.
@@ -247,6 +249,7 @@ backed by the same diff engine:
 ### 7.3 Mouse / touch
 - Click to position cursor; drag to select.
 - Word/line select on double/triple click.
+- Drag-select past the top/bottom edge autoscrolls (§9.24).
 - Scroll via wheel, touchpad, or scrollbar.
 - Hover events exposed for tooltip-style extensions.
 - **Drag-and-drop of selected text**: drag from inside a selection moves the text (or
@@ -434,6 +437,43 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
   so the strip and the thumb stay in lockstep with what's on screen.
 - Lines touched by a non-empty selection, and (when find is active) search
   matches, are marked along the strip.
+
+## 9.24 Autoscroll during selection
+- While a selection drag is in progress (linear drag-select **and** rectangular
+  Alt-drag, §9.15) and the pointer reaches — or passes — the top or bottom edge
+  of the text viewport, the view scrolls automatically so the selection can
+  extend beyond the lines currently on screen. The selection head tracks the
+  freshly revealed line each frame, so releasing the mouse leaves the selection
+  ending wherever the autoscroll carried it. This is the standard
+  "drag to the edge to keep selecting" behavior; it does **not** apply to the
+  scroll wheel or keyboard selection, which already reach off-screen text.
+- **Trigger band.** A band one line-height tall (clamped to at most a third of
+  the viewport, so it degrades gracefully on a very short editor) sits at the
+  top and bottom edges. The pointer entering a band starts autoscroll; the
+  pointer may also leave the viewport entirely (above the top / below the
+  bottom), which is treated as being deeper into the band.
+- **Speed.** Proportional to how far the pointer is past the band's inner edge,
+  shaped superlinearly so it stays slow and precise just inside the band and
+  accelerates as the pointer pushes toward and beyond the viewport edge. It is
+  scaled in line-heights (font-size / DPI independent), reaching ≈½ line per
+  frame at the viewport edge and capped at ≈1¼ lines per frame past it, so a
+  fast flick never produces a runaway scroll. (Modeled on Zed's
+  `scale_vertical_mouse_autoscroll_delta`: a `distance^k` ramp with a hard cap.)
+- **Continuity.** The scroll continues while the button is held at the edge even
+  if the pointer stops moving — it is driven per held frame, not per pointer-move
+  event — and stops the instant the pointer leaves the band, the scroll reaches
+  either document end (nothing left to reveal), or the button is released.
+- Horizontal autoscroll (dragging past the left/right edge with wrap off) is a
+  natural extension of the same mechanic but is **not** in this version; the
+  hosted editor wraps long lines by default (§3.8), so the vertical case is what
+  users hit. Text-drag (§7.3 / §9.19) could adopt the same edge autoscroll for
+  dropping far off-screen; also deferred.
+- **Where it lives.** The mechanic is backend-neutral and ships in the `editor`
+  package (`editor-view`): the speed curve and per-frame scroll+extend run in
+  `command` during drag handling, so any host backend gets it for free. The egui
+  adapter only contributes the "keep painting while held at the edge" repaint
+  signal (it reads `ViewState::autoscroll_active`), since egui otherwise repaints
+  only on input.
 - Classification and color come entirely from the decoration layers the
   editor already paints from, so any provider the host wired up (markdown,
   diff, search…) participates automatically — the minimap reads decorations,
