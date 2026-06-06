@@ -78,11 +78,10 @@ application would be built on.
 - Custom widgets that occupy inline space within a row (e.g. a checkbox glyph, a colored
   badge, a fold-region pill).
 - Widgets are measured by the editor and laid out among the glyphs.
-- A widget may opt to render as plain styled text via the `display()` trait method
-  (returning text + bg/fg/strikethrough). The painter renders the supplied text as the
-  segment's galley with the bg fill instead of the bordered placeholder. Used by hosts
-  that want a small textual insertion at a byte position (patch-review's intraline
-  `new_str`, future inline diagnostics, etc.) without introducing a new decoration variant.
+- A widget may opt to render as plain styled text (supplying text + bg/fg/strikethrough)
+  rather than the bordered placeholder, so a host can insert a small styled text segment
+  at a byte position (patch-review's intraline `new_str`, future inline diagnostics)
+  without a new decoration variant.
 - End-of-line widgets — an inline widget whose range starts at the line's last byte
   (i.e. at the newline / EOF position) renders as a trailing segment after the line's
   text rather than being clipped to zero width. Lets a host append visible text past
@@ -92,25 +91,21 @@ application would be built on.
 - Widgets that occupy a full row of their own above or below a buffer line (e.g. an inline
   image, a diff-context expander, an embedded chart).
 - Block widgets supply their own height.
-- Pure-data action-row variant — `BlockKind::ActionRow { label, glyph, tone, buttons }`
-  renders a thin horizontal strip with a label on the left and a row of clickable
-  buttons on the right. Each enabled button registers a `ClickAction::WidgetClick(id)`
+- Pure-data action-row variant — a thin horizontal strip with a label on the left and a
+  row of clickable buttons on the right, each enabled button registering a widget-click
   on its own rect. Used by patch-review for the per-hunk Accept / Reject row and the
-  unanchored-pin Reject row; available to any host that wants a generic button-bar block.
+  unanchored-pin Reject row; available to any host wanting a generic button-bar block.
 
 ### 3.6 Folding / replace
 - Hide a range of text behind a placeholder widget (the standard code-folding behavior).
 - Cursor motion treats a folded region as a single step.
-- **Expansion controls** (the "dropdown thingies" common in code/note editors): clickable
-  chevron / triangle markers in the gutter (or inline) that toggle a fold
-  open/closed. Two specific shapes the widget must support:
-  - **Per-language fold regions**: code blocks/braces/markdown sections that the
-    user can collapse. Chevron in the gutter.
-  - **Diff context expansion**: at the boundary between a shown hunk and
-    elided unchanged context, an inline "▼ N unchanged lines" affordance that
-    reveals the hidden context when clicked (and a corresponding "▲" to recollapse).
-    VSCode shows these between hunks; note editors use similar dropdowns for
-    collapsible sections.
+- **Expansion controls**: clickable chevron / triangle markers in the gutter (or inline)
+  that toggle a fold open/closed. Two shapes the widget must support:
+  - **Per-language fold regions**: collapsible code blocks/braces/markdown sections.
+    Chevron in the gutter.
+  - **Diff context expansion**: at the boundary between a shown hunk and elided
+    unchanged context, an inline "▼ N unchanged lines" affordance reveals the hidden
+    context when clicked (and a "▲" to recollapse).
 
 Both shapes are the same underlying primitive: a fold model that owns a set of
 `(range, collapsed: bool)` entries, surfaced as `Replace` decorations when
@@ -185,15 +180,13 @@ Live-preview behaviors:
 - Tables render as proper table widgets when not being edited — aligned columns, optional
   header styling.
 - Cursor entering the table region transitions back to source view for editing, or stays
-  in a structured cell-edit mode (TBD which feels better — see open questions in
-  IMPLEMENTATION.md).
+  in a structured cell-edit mode (TBD — see IMPLEMENTATION.md).
 - Wiki-style table extensions: cell alignment markers, simple column-resize cues.
 
 ### 4.2 Live-preview UX rules
 - "Reveal source on cursor line" is the universal rule: whichever line the cursor is on
-  shows raw markdown; everywhere else shows the rendered form. This is the inline live-preview
-  Live Preview mode, and it should be the default. A pure-source-view mode and a
-  pure-render-view mode are both available toggles.
+  shows raw markdown; everywhere else shows the rendered form. This inline live-preview
+  mode is the default. Pure-source-view and pure-render-view modes are both available toggles.
 
 ---
 
@@ -295,8 +288,7 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
 - Content is a small render callback that draws into a sub-painter, so extensions can put
   arbitrary egui UI (buttons, lists, code snippets) inside.
 - Use cases: hover for diagnostic messages, hover for footnote definitions, completion popup.
-- In egui (immediate mode) this is non-trivial — done once in the widget instead of
-  re-solved by every extension.
+- Solved once in the widget rather than re-solved by every extension (non-trivial in egui's immediate mode).
 
 ## 9.6 Autocomplete
 - Pluggable provider model: a `CompletionSource` produces `CompletionItem`s for a given
@@ -419,61 +411,21 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
   strip scrolls the document. Off by default; the host toggles it and owns
   its width.
 - Two render **styles**, selectable by the host:
-  - **Glyphs** — a literal scaled-down view of the text: one cell per
-    character, each tinted by the same syntax/decoration color the editor
-    paints that span with. It renders from the editor's *display* model, so
-    it mirrors live preview (hidden markdown markers, heading styling, list
-    bullets/checkboxes) and **soft-wrap** — a line that wraps into three rows
-    in the editor wraps into three rows here. Scaled uniformly so wrapped
-    rows fit the strip width at true aspect (a short doc occupies the top of
-    the strip rather than stretching to fill it). This is the default — it
-    reads as a true miniature of the page.
-  - **Bars** — a structural abstraction: one bar per line, width set by the
-    line's visible (non-whitespace) length and color by its structural role
-    (heading / code / quote / emphasis / plain), derived from decoration
-    layers. Denser and more schematic than glyphs.
+  - **Glyphs** (default) — a literal scaled-down view of the text: one cell per
+    character, tinted by the same syntax/decoration color the editor paints that
+    span with. Renders from the editor's *display* model, so it mirrors live
+    preview (hidden markers, heading styling, list bullets/checkboxes) and
+    **soft-wrap** — a line wrapping into three rows in the editor wraps into three
+    here. Scaled uniformly at true aspect (a short doc occupies the top of the
+    strip rather than stretching to fill it).
+  - **Bars** — a structural abstraction: one bar per line, width set by the line's
+    visible (non-whitespace) length and color by its structural role (heading /
+    code / quote / emphasis / plain), derived from decoration layers.
 - Both styles share one projection with the editor: soft-wrapped lines take
   proportionally more height, headings scale up, folded/hidden lines vanish —
   so the strip and the thumb stay in lockstep with what's on screen.
 - Lines touched by a non-empty selection, and (when find is active) search
   matches, are marked along the strip.
-
-## 9.24 Autoscroll during selection
-- While a selection drag is in progress (linear drag-select **and** rectangular
-  Alt-drag, §9.15) and the pointer reaches — or passes — the top or bottom edge
-  of the text viewport, the view scrolls automatically so the selection can
-  extend beyond the lines currently on screen. The selection head tracks the
-  freshly revealed line each frame, so releasing the mouse leaves the selection
-  ending wherever the autoscroll carried it. This is the standard
-  "drag to the edge to keep selecting" behavior; it does **not** apply to the
-  scroll wheel or keyboard selection, which already reach off-screen text.
-- **Trigger band.** A band one line-height tall (clamped to at most a third of
-  the viewport, so it degrades gracefully on a very short editor) sits at the
-  top and bottom edges. The pointer entering a band starts autoscroll; the
-  pointer may also leave the viewport entirely (above the top / below the
-  bottom), which is treated as being deeper into the band.
-- **Speed.** Proportional to how far the pointer is past the band's inner edge,
-  shaped superlinearly so it stays slow and precise just inside the band and
-  accelerates as the pointer pushes toward and beyond the viewport edge. It is
-  scaled in line-heights (font-size / DPI independent), reaching ≈½ line per
-  frame at the viewport edge and capped at ≈1¼ lines per frame past it, so a
-  fast flick never produces a runaway scroll. (Modeled on Zed's
-  `scale_vertical_mouse_autoscroll_delta`: a `distance^k` ramp with a hard cap.)
-- **Continuity.** The scroll continues while the button is held at the edge even
-  if the pointer stops moving — it is driven per held frame, not per pointer-move
-  event — and stops the instant the pointer leaves the band, the scroll reaches
-  either document end (nothing left to reveal), or the button is released.
-- Horizontal autoscroll (dragging past the left/right edge with wrap off) is a
-  natural extension of the same mechanic but is **not** in this version; the
-  hosted editor wraps long lines by default (§3.8), so the vertical case is what
-  users hit. Text-drag (§7.3 / §9.19) could adopt the same edge autoscroll for
-  dropping far off-screen; also deferred.
-- **Where it lives.** The mechanic is backend-neutral and ships in the `editor`
-  package (`editor-view`): the speed curve and per-frame scroll+extend run in
-  `command` during drag handling, so any host backend gets it for free. The egui
-  adapter only contributes the "keep painting while held at the edge" repaint
-  signal (it reads `ViewState::autoscroll_active`), since egui otherwise repaints
-  only on input.
 - Classification and color come entirely from the decoration layers the
   editor already paints from, so any provider the host wired up (markdown,
   diff, search…) participates automatically — the minimap reads decorations,
@@ -482,10 +434,33 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
   independent of document length. The strip is rasterized once into an
   offscreen image and redrawn as a single textured quad; it only re-rasterizes
   when the document, decorations, theme, or strip size change — never on
-  scroll. (See §8 and IMPLEMENTATION §16.6.18.)
+  scroll. (See §8.)
 - Host-configurable: style, width, palette, and the per-feature toggles
   (viewport thumb, section rules, left edge). The renderer is swappable — a
   host could supply an alternative strip without touching the editor core.
+
+## 9.24 Autoscroll during selection
+- While a selection drag is in progress (linear drag-select **and** rectangular
+  Alt-drag, §9.15) and the pointer reaches or passes the top or bottom edge of
+  the text viewport, the view scrolls automatically so the selection can extend
+  beyond the lines on screen. The selection head tracks the freshly revealed
+  line each frame, so releasing the mouse leaves the selection wherever the
+  autoscroll carried it. The standard "drag to the edge to keep selecting"
+  behavior; it does **not** apply to the scroll wheel or keyboard selection.
+- Speed is tuned for precision near the edge: slow and precise just inside a
+  trigger band at the edge, accelerating (with a hard cap, so a fast flick never
+  runs away) as the pointer pushes toward and past the viewport edge. Scaled in
+  line-heights, so it's font-size / DPI independent.
+- **Continuity.** The scroll continues while the button is held at the edge even
+  if the pointer stops moving (driven per held frame, not per pointer-move) and
+  stops the instant the pointer leaves the band, the scroll reaches a document
+  end, or the button is released.
+- Horizontal autoscroll (dragging past the left/right edge with wrap off) and
+  text-drag edge autoscroll (§7.3 / §9.19) are natural extensions but deferred;
+  the hosted editor wraps long lines by default (§3.8), so the vertical case is
+  what users hit. The mechanic is backend-neutral — the speed curve and
+  per-frame scroll+extend live in the editor core, so any host backend gets it
+  for free.
 
 ## 9.9 Serialization
 - `EditorState` and individual `StateField`s are `Serialize`/`Deserialize` (serde) so the
@@ -503,16 +478,14 @@ the widget renders. Live reconfiguration (swap language, swap theme) is supporte
 - LSP, file watching, project management — these belong to the host.
 - Terminal / TUI backend.
 - Macro recording.
-- **Math rendering** (KaTeX/MathML) — primitives exist via block widgets; bundling a math
-  renderer is out of v1 scope. The widget detects `$…$` / `$$…$$` regions and ships
-  visual placeholder styling; rendering math glyphs / TeX output is the host's
-  responsibility (typically by registering a `BlockWidget` that calls into a TeX
-  renderer like `mathemascii` or a WebView).
+- **Math rendering** (KaTeX/MathML) — the widget detects `$…$` / `$$…$$` regions and ships
+  visual placeholder styling; rendering math glyphs is the host's job (register a
+  `BlockWidget` calling a TeX renderer or WebView). Primitives exist via block widgets;
+  bundling a renderer is out of v1 scope.
 - **Diagram embedding** (Mermaid, PlantUML) — same: the widget detects ` ```mermaid `
-  fences and applies visual styling; the host registers a `BlockWidget` to render
-  the actual diagram (e.g. via `mermaid-cli` to SVG → egui image, or a JS bridge in
-  a WebView). The widget does NOT bundle a Mermaid runtime — that would add a JS
-  engine dep and is rightly a host concern in a native UI.
+  fences and applies visual styling; the host registers a `BlockWidget` to render the
+  actual diagram. The widget does NOT bundle a Mermaid runtime (a JS-engine dep, rightly
+  a host concern in a native UI).
 - **Snippet expansion with tab-stops** — primitives in place (transaction filter,
   decoration-based highlighted ranges) but the snippet syntax engine is post-v1.
 - **LSP-driven completion / hover / go-to-definition** — the widget exposes the surface
@@ -540,25 +513,21 @@ be added later without rewriting the editor. See `IMPLEMENTATION.md` §11.
 These aren't end-user features but they're the host-facing API surface that
 makes the extension surface feel familiar to extension authors.
 
-### 13.1 Facet<Input, Output>
-Typed multi-provider channels. An extension declares a facet (typed by its
-input and output); other extensions register providers; the editor combines
-them via the facet's `combine` function and exposes the result through
-state. Required for: theme providers, completion sources (already shipped
-as a Vec), tooltip providers, diagnostic providers, keymap layers, panel
-providers.
+### 13.1 Facet
+Typed multi-provider channels: an extension declares a facet, others register
+providers, the editor combines them and exposes the result through state.
+Required for: theme providers, completion sources (already shipped as a Vec),
+tooltip providers, diagnostic providers, keymap layers, panel providers.
 
-### 13.2 StateField<T>
-Extension-owned reactive state slot. Each field declares a `create` and
-`update(state, transaction) -> T`. Replaces the current pattern where
-features like history, folds, and IME state live as named fields on
-`EditorState`/`ViewState`.
+### 13.2 StateField
+Extension-owned reactive state slot that recomputes in response to transactions.
+Replaces the current pattern where features like history, folds, and IME state
+live as named fields on `EditorState`/`ViewState`.
 
 ### 13.3 ViewPlugin
-A per-view stateful plugin that gets `create(view)` once and `update(view,
-transactionsSinceLastUpdate)` per frame. Used for things like
-tooltip-reposition-on-selection-change, lazy decoration computation, scroll
-syncing.
+A per-view stateful plugin created once and updated each frame with the
+transactions since its last update. Used for tooltip-reposition-on-selection-change,
+lazy decoration computation, scroll syncing.
 
 ### 13.4 Transaction hooks
 - `changeFilter` — veto or reshape a `ChangeSet` before it applies (e.g.
@@ -569,17 +538,11 @@ syncing.
   (e.g. analytics, telemetry annotations).
 
 ### 13.5 Tree-sitter language adapter
-The `Language` trait already exists in spirit (parsers + indent + bracket
-rules). The implementation surface adds a Tree-sitter binding crate
-(`editor-ts`) with:
-- Incremental reparse driven by `ChangeSet → InputEdit`
-- Highlight token → theme color via `theme.tokens`
-- Per-language fold detection from query files
-- Indent detection from query files
-- Bracket-match pair list per language
-
-Bundles parsers as optional Cargo features per language. The host enables
-the parsers it wants; the rest don't ship.
+The `Language` trait already exists in spirit (parsers + indent + bracket rules);
+the implementation adds a Tree-sitter binding crate (`editor-ts`) providing
+incremental reparse, highlight-token → theme color, and per-language fold / indent /
+bracket-match detection from query files. Parsers bundle as optional Cargo features
+per language — the host enables what it wants; the rest don't ship.
 
 ### 12.1 WebAssembly
 The widget compiles to `wasm32-unknown-unknown`. `Instant` is provided by the `web-time`

@@ -10,14 +10,14 @@ layout, types, data structures, build order. SPEC.md says *what*; this says *how
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Rust edition | 2024, stable | No nightly features. |
-| Async in core | **No tokio in editor-core.** Pure sync (State, Tx) → State. | Matches Helix's `helix-core`, Zed's `crates/text`, CM6. Async (LSP, fs, background parse) lives in the host or in worker threads producing transactions. |
-| Persistent collections | **Hand-rolled SumTree** from day one. | Same structure backs rope, RangeSet, and Selection storage. Avoids retrofitting later. |
-| Rope | SumTree-of-UTF8-chunks, behind `trait Rope`. **No ropey dep.** | Custom rope decided based on user preference; SumTree is needed anyway for RangeSet so reusing it is cheap. |
-| IME | Decoupled from egui via an `InputEvent` enum in `editor-view`. Host translates platform events. | User requirement: don't tie IME to egui. |
-| Bidi | Deferred entirely. APIs are LTR-only; revisit if ever needed. | User does not need it. |
+| Async in core | **No tokio in editor-core.** Pure sync (State, Tx) → State. | Async (LSP, fs, background parse) lives in the host or in worker threads producing transactions. |
+| Persistent collections | **Hand-rolled SumTree** from day one. | Same structure backs rope, RangeSet, and Selection storage. |
+| Rope | SumTree-of-UTF8-chunks. **No ropey dep.** | SumTree is needed anyway for RangeSet. |
+| IME | Decoupled from egui via an `InputEvent` enum in `editor-view`. Host translates platform events. | Requirement: don't tie IME to egui. |
+| Bidi | Deferred entirely. APIs are LTR-only. | |
 | Accessibility | Deferred. | v2. |
-| Diff view | In v1. Side-by-side + unified+intraline. | User priority feature. |
-| Live preview | Full markdown live preview (inline mode) in v1, including tables. | User priority feature. |
+| Diff view | In v1. Side-by-side + unified+intraline. | |
+| Live preview | Full markdown live preview (inline mode) in v1, including tables. | |
 | Workspace | Multi-crate: core / view / egui / md / ts. | Renderer-agnostic state layer; testable headlessly. |
 
 ---
@@ -85,8 +85,7 @@ enum Node<T: Item> {
 - `concat`, `split_at(pos: D)`, `slice(range: Range<D>)`, `edit(splice: Edit<T>)` are the
   core ops; everything else is built on `Cursor` + these.
 
-Lifted directly from Zed's `crates/sum_tree`. We are not reinventing; we are implementing
-the same idea against our own use cases.
+Mirrors Zed's `sum_tree`.
 
 ---
 
@@ -108,34 +107,20 @@ pub struct ChunkSummary {
 pub struct Rope(SumTree<Chunk>);
 ```
 
-Public API:
+Public API (representative):
 
 ```rust
 impl Rope {
-    pub fn new() -> Self;
     pub fn from_str(s: &str) -> Self;
-    pub fn len_bytes(&self) -> usize;
-    pub fn len_chars(&self) -> usize;
-    pub fn len_lines(&self) -> usize;
-
     pub fn slice(&self, bytes: Range<usize>) -> RopeSlice<'_>;
-    pub fn chunks(&self) -> Chunks<'_>;
-    pub fn bytes(&self) -> Bytes<'_>;
-    pub fn chars(&self) -> Chars<'_>;
-
-    pub fn byte_to_char(&self, byte: usize) -> usize;
-    pub fn char_to_byte(&self, ch: usize) -> usize;
     pub fn byte_to_line(&self, byte: usize) -> usize;
-    pub fn line_to_byte(&self, line: usize) -> usize;
-    pub fn byte_to_utf16(&self, byte: usize) -> usize;
-    pub fn utf16_to_byte(&self, utf16: usize) -> usize;
-
-    pub fn line(&self, idx: usize) -> RopeSlice<'_>;
-    pub fn line_len(&self, idx: usize) -> usize;          // bytes
-    pub fn grapheme_before(&self, byte: usize) -> usize;
-    pub fn grapheme_after(&self, byte: usize) -> usize;
+    // …
 }
 ```
+
+Also: `new`, len queries (`len_bytes/chars/lines`), iterators (`chunks/bytes/chars`),
+the position conversions (`byte_to_char`/`char_to_byte`/`line_to_byte`/`byte_to_utf16`
+and inverses), `line(idx)`/`line_len(idx)`, and `grapheme_before/after(byte)`.
 
 All positions are **byte offsets** by default. Char / line / utf16 conversions are O(log n)
 via `Dimension`-typed cursors.
@@ -659,25 +644,23 @@ View modes:
 
 ## 16.5 Additional capabilities (post-foundation)
 
-Each of these maps a SPEC entry to a concrete implementation surface.
-Ordered roughly from smallest to largest in code impact.
-
+Each maps a SPEC entry to an implementation surface, ordered roughly smallest to largest.
 **Status legend**: ✅ implemented · ⚠️ partial · 📋 spec only.
 
-| # | Feature | Status | Where |
-|---|---------|--------|-------|
-| 16.5.1 | Diagnostics API | ✅ | `editor-core::diagnostic`, `editor-view::diagnostics` |
-| 16.5.2 | Tooltip | ✅ | `editor-view::tooltip`, `editor-egui::tooltip` |
-| 16.5.3 | Autocomplete | ✅ | `editor-view::completion`, `editor-egui::completion`, `editor-md::completion` |
-| 16.5.4 | Auto-pair brackets | ✅ (incl. skip-over-close) | `editor-view::autopair` |
-| 16.5.5 | Atomic ranges | ✅ | `editor-view::motion::skip_atomic_ranges` |
-| 16.5.6 | Widget event semantics | ⚠️ traits + placeholder paint | `editor-core::decoration`, `editor-egui::widget` |
-| 16.5.7 | Drag-and-drop | ✅ | `editor-view::command::handle_mouse_with_mods` |
-| 16.5.8 | Serialization | ⚠️ behind `serde` feature; ChangeSet + trait-object decorations TODO | `editor-core/*` |
-| 16.5.9 | Post-transaction listeners | ✅ | `editor-core::state::TransactionListener` |
-| 16.5.10 | Compartments | ✅ | `editor-core::compartment` |
-| 16.5.11 | Soft line wrapping | ✅ | `editor-view::wrap`, `editor-egui::widget` |
-| 16.5.12 | Markdown extensions | ✅ (math/mermaid are visual placeholders) | `editor-md/*` |
+| # | Feature | Status |
+|---|---------|--------|
+| 16.5.1 | Diagnostics API | ✅ |
+| 16.5.2 | Tooltip | ✅ |
+| 16.5.3 | Autocomplete | ✅ |
+| 16.5.4 | Auto-pair brackets | ✅ (incl. skip-over-close) |
+| 16.5.5 | Atomic ranges | ✅ |
+| 16.5.6 | Widget event semantics | ⚠️ traits + placeholder paint |
+| 16.5.7 | Drag-and-drop | ✅ |
+| 16.5.8 | Serialization | ⚠️ behind `serde` feature; ChangeSet + trait-object decorations TODO |
+| 16.5.9 | Post-transaction listeners | ✅ |
+| 16.5.10 | Compartments | ✅ |
+| 16.5.11 | Soft line wrapping | ✅ |
+| 16.5.12 | Markdown extensions | ✅ (math/mermaid are visual placeholders) |
 
 ### 16.5.1 Diagnostics API (SPEC §9.7)
 
@@ -916,31 +899,30 @@ Each shipped in `editor-md/src/`:
 
 ## 16.6 CM6-parity additions
 
-| # | Feature | Status | Where |
-|---|---------|--------|-------|
-| 16.6.1 | Bracket matching | ✅ | `editor-view::brackets` |
-| 16.6.2 | Active-line highlight | ✅ | `editor-view::highlights::active_line_decorations` |
-| 16.6.3 | Placeholder text | ✅ | `ViewState::placeholder` + widget paint |
-| 16.6.4 | Search engine | ✅ | `editor-view::search` |
-| 16.6.4 | Search panel UI | ✅ | `editor-egui::panel::paint_search_panel` |
-| 16.6.5 | Indent-on-input (markdown) | ✅ | `editor-md::MarkdownIndent` via `IndentProvider` trait |
-| 16.6.6 | Rectangular selection | ✅ | `DragState::RectangleSelecting` |
-| 16.6.7 | Special-char rendering | ✅ | `editor-view::special_chars` |
-| 16.6.8 | Trailing-whitespace highlight | ✅ | `editor-view::highlights::trailing_whitespace_decorations` |
-| 16.6.9 | Scroll past end | ✅ | `ViewState::scroll_past_end` |
-| 16.6.10 | Transaction hook filters | ✅ | `editor-core::state` ChangeFilter / TransactionFilter / TransactionExtender |
-| 16.6.11 | Drop cursor indicator | ✅ | painter check on `DragState::DraggingSelection` |
-| 16.6.12 | Themes as data | ✅ | `editor-core::theme`; all providers accept `Option<&Theme>` |
-| 16.6.13 | Panels framework | ✅ | `editor-view::panel`, `editor-egui::panel::paint_panels` |
-| 16.6.14 | Snippet expansion + tab stops + mirrors | ✅ | `editor-view::snippet` |
-| 16.6.15 | Facet / StateField / ViewPlugin | ⚠️ scaffold only; built-ins not migrated | `editor-core::facet` |
-| 16.6.16 | Tree-sitter integration | ⚠️ crate + framework; per-language grammar deps gated, not bundled | `crates/editor-ts/` |
-| 16.6.17 | Undo tree | ✅ | `editor-core::history` with parent/last_child + `earlier`/`later` |
+| # | Feature | Status |
+|---|---------|--------|
+| 16.6.1 | Bracket matching | ✅ |
+| 16.6.2 | Active-line highlight | ✅ |
+| 16.6.3 | Placeholder text | ✅ |
+| 16.6.4 | Search engine | ✅ |
+| 16.6.4 | Search panel UI | ✅ |
+| 16.6.5 | Indent-on-input (markdown) | ✅ |
+| 16.6.6 | Rectangular selection | ✅ |
+| 16.6.7 | Special-char rendering | ✅ |
+| 16.6.8 | Trailing-whitespace highlight | ✅ |
+| 16.6.9 | Scroll past end | ✅ |
+| 16.6.10 | Transaction hook filters | ✅ |
+| 16.6.11 | Drop cursor indicator | ✅ |
+| 16.6.12 | Themes as data | ✅ |
+| 16.6.13 | Panels framework | ✅ |
+| 16.6.14 | Snippet expansion + tab stops + mirrors | ✅ |
+| 16.6.15 | Facet / StateField / ViewPlugin | ⚠️ scaffold only; built-ins not migrated |
+| 16.6.16 | Tree-sitter integration | ⚠️ crate + framework; per-language grammar deps gated, not bundled |
+| 16.6.17 | Undo tree | ✅ |
 
 ### 16.6 CM6-parity additions (post-polish round)
 
-Following a gap audit against CM6 (SPEC §9.10–§9.22, §13). Each item below
-maps directly to a SPEC section; sub-§§ sketch the implementation surface.
+Gap audit against CM6 (SPEC §9.10–§9.22, §13); each sub-§ sketches the implementation surface.
 
 ### 16.6.1 Bracket matching (SPEC §9.10)
 
@@ -988,12 +970,9 @@ pub struct SearchState {
     pub matches: Vec<Range<usize>>,
     pub current_idx: Option<usize>,
 }
-pub fn run_search(state: &EditorState, query: &str, flags: SearchFlags) -> Vec<Range<usize>>;
-pub fn next_match(state: &EditorState, search: &SearchState) -> Option<usize>;
-pub fn replace_current(state: &EditorState, search: &SearchState) -> Option<Transaction>;
-pub fn replace_all(state: &EditorState, search: &SearchState) -> Option<Transaction>;
 ```
-Add `search: SearchState` to `ViewState`. egui adapter draws a panel at the
+Free fns over `(state, query/search)`: `run_search`, `next_match`,
+`replace_current`, `replace_all`. Add `search: SearchState` to `ViewState`. egui adapter draws a panel at the
 bottom of the editor (§16.6.13 panels) when `search.active`. Cmd-F opens,
 Esc closes. The match-highlight decorations come from a new
 `search_decorations(state, search)` that emits `Mark { bg }` per match plus
@@ -1197,122 +1176,78 @@ undo create a sibling instead of dropping the redo branch.
 
 ### 16.6.18 Minimap (SPEC §9.23)
 
-`editor-egui::minimap`. The strip is a host-facing widget over `&EditorState
-+ &mut ViewState` (same shape as the main `Widget`). The original renderer
-issued one `rect_filled` per visible line **every frame**; that's the scroll
-jank SPEC §8 forbids. The fix and the new glyph style are the same move:
-rasterize the strip into an offscreen image once, upload it as a single egui
-texture, and paint one quad — rebuilding only when inputs that affect pixels
-change, never on scroll.
+`editor-egui::minimap`. Host-facing widget over `&EditorState + &mut ViewState`.
+Strip is rasterized offscreen once, uploaded as one egui texture, painted as one
+quad — rebuilt only on pixel-affecting input changes, never on scroll.
 
-**Texture-backed renderer.** A host-owned `MinimapImage` cache replaces the
-per-frame draw loop:
+**Texture-backed renderer.**
 ```rust
-pub struct MinimapImage {
-    tex: Option<egui::TextureHandle>,
-    key: u64,            // rebuild fingerprint (below)
-    size: [usize; 2],    // strip pixel dims the tex was built at
-}
+pub struct MinimapImage { tex: Option<egui::TextureHandle>, key: u64, size: [usize; 2] }
 ```
-Rebuild fingerprint mixes `doc.content_id()`, `decorations.signature`, a
-theme/`Options` hash, the strip's pixel `W×H`, and the selected `style`. On a
-frame where the key is unchanged the widget just paints the cached texture +
-the live overlay (thumb, selection/search marks, interaction); on a change it
-re-rasterizes a fresh `egui::ColorImage`, uploads via
-`ui.ctx().load_texture(...)` (or `tex.set(...)`), and repaints. This keeps
-the egui-side type off `ViewState` exactly like `PaintCache` / the existing
-`minimap::Cache` do — the cache lives on the host `Buffer`, threaded in via
-`.with_image_cache(...)`.
+- Rebuild fingerprint `key` mixes `doc.content_id()`, `decorations.signature`, a
+  theme/`Options` hash, strip pixel `W×H`, `style`, `total_content`, and
+  `wrap_map.width()`/`enabled()` (so an editor-width reflow rebuilds).
+- Key unchanged → paint cached texture + live overlay. Changed → re-rasterize a fresh
+  `ColorImage`, upload via `ctx().load_texture`/`tex.set`, repaint.
+- egui-side type stays off `ViewState` (like `PaintCache`); cache lives on host
+  `Buffer`, threaded via `.with_image_cache(...)`.
 
-**Projection (shared, unchanged).** Keep the current `height_map`-driven
-mapping: `scale = strip_h / total_content`, per-line `y = y_at_text(line) *
-scale`, `h = text_height(line) * scale`. This preserves lockstep with wrap /
-heading scale / hidden lines. The rasterizer walks lines and writes each
-line's pixel rows `[y, y+h)` into the buffer. When `total_content` exceeds the
-strip, rows collapse/blend (VSCode `MinimapSamplingState`-style downsampling
-falls out of the projection naturally — multiple lines map to one pixel row).
-Texture height is bounded to the strip, so it never approaches GPU max-texture
-limits.
+**Projection (shared).** `height_map`-driven: `scale = strip_h / total_content`,
+per-line `y = y_at_text(line)·scale`, `h = text_height(line)·scale` — lockstep with
+wrap / heading scale / hidden lines. Rasterizer writes each line's rows `[y, y+h)`.
+`total_content > strip` → multiple lines collapse to one pixel row. Texture height is
+bounded to the strip (never nears GPU max-texture limits).
 
-**Bars style** (`MinimapStyle::Bars`): port the existing
-`measure_lines` + `classify_lines` (`LineMetrics`, `LineKind`) — already memoized
-by `minimap::Cache` — but write the bar/indent rects, section rules, and mark
-strips **into the pixel buffer** instead of issuing `painter.rect_filled`.
-Same look, now O(1) per frame.
+**Bars style** (`MinimapStyle::Bars`): reuse `measure_lines` + `classify_lines`
+(`LineMetrics`, `LineKind`, memoized by `minimap::Cache`); write bar/indent rects,
+section rules, mark strips into the pixel buffer instead of `rect_filled`.
 
-**Glyphs style** (`MinimapStyle::Glyphs`, default): a VSCode-style glyph
-atlas built by reading back egui's *own* rasterization — no new dependency
-(`ab_glyph` is already transitive):
+**Glyphs style** (`MinimapStyle::Glyphs`, default): glyph atlas read back from egui's
+own rasterization (no new dep; `ab_glyph` already transitive):
 ```rust
-struct GlyphAtlas {
-    cw: usize, ch: usize,          // shared line-box cell (≈ advance × font line-height, ×2 SS)
-    cov: Vec<f32>,                 // coverage per cell pixel, indexed by ASCII 0x20..=0x7E
-    advance: f32, font_size: f32,  // cache key + per-column step
-}
+struct GlyphAtlas { cw: usize, ch: usize, cov: Vec<f32>, advance: f32, font_size: f32 }
+//                  shared line-box cell  coverage/cell px  cache key + column step
 ```
-Build: lay out printable ASCII once at the editor font size; snapshot the
-font atlas (`ui.fonts(|f| f.image())` → `ColorImage`, coverage in alpha) and,
-for each glyph, **rasterize it into a shared line-box cell at its true
-baseline** — for each cell pixel, map to a point in `[0,advance]×[0,font_h]`,
-test whether it lands in the glyph's bitmap rect (`glyph.pos + uv_rect.offset`,
-size `uv_rect.size` — epaint's own placement formula, `pos.y` = baseline) and
-sample the atlas there. This preserves x-height/cap-height/descenders and a
-common baseline, so the text reads correctly; **do NOT** stretch each glyph's
-tight bbox to fill the cell (every letter ends up the same height → mush).
-Cache keyed on `font_size`; rebuilds only when it changes. Non-ASCII → block
-fallback.
-Rasterize a line: take the per-span fg colors from the same `LineLayout`
-the editor paints (`widget::layout` segments carry the resolved
-`Color32`), and for each char blit `sprite[ch] * fg` into the buffer at the
-char's x-cell (`alpha * fg over bg`). Indentation, density, and syntax color
-are all preserved → a true miniature.
+- Build: lay out printable ASCII (`0x20..=0x7E`) once at editor font size; snapshot the
+  atlas (`ui.fonts(|f| f.image())`); rasterize each glyph into the shared cell **at its
+  true baseline** (map each cell px into `[0,advance]×[0,font_h]`, test the glyph bitmap
+  rect via epaint's placement formula, sample). Preserves x-height/cap-height/descenders
+  + common baseline. **Do NOT** stretch each glyph's tight bbox to fill the cell (uniform
+  height → mush). Cache keyed on `font_size`. Non-ASCII → block fallback.
+- Rasterize a line: per-span fg from the same `LineLayout` the editor paints
+  (`widget::layout` segments carry resolved `Color32`); blit `sprite[ch]·fg` (alpha-over-bg)
+  at each char's x-cell. Preserves indentation, density, syntax color.
 
-**Live preview + soft-wrap.** When lines are ≥ ~2px tall (i.e. not a huge
-doc collapsing to density), glyph rendering goes through the editor's
-*display* model rather than raw `doc.line_str`: `widget::layout::display_rows`
-reuses `LineLayoutBuilder` per visual row (split by `view.wrap_map`'s
-`vlines`) and flattens the decorated segments to `(display_text, fg,
-is_widget)` runs — so hidden markdown markers, heading styling, and list
-bullet/checkbox widgets render exactly as the editor shows them, and a line
-that soft-wraps into N rows occupies N minimap rows. Below ~2px it falls back
-to the cheap per-line decimated path (glyphs are sub-pixel; only density
-reads). Heading rows are taller *and* wider: markdown emits both
-`Line{height_scale}` and `Mark{font_scale}`, so each display row recovers its
-font scale (`row_h / (line_h·scale)`) and widens the glyph advance by it —
-otherwise headings stretch tall-and-thin. To keep the cell from over-magnifying
-short docs, the glyph atlas
-cell adapts to the font (`cw≈advance`, `ch≈advance·1.7`) so the blit is ~1:1
-when the doc fits and a clean downscale when it doesn't, and plain ink uses
-`color_plain` unmultiplied to full opacity with a coverage contrast curve so
-small text doesn't wash out.
+**Live preview + soft-wrap** (glyphs, lines ≥ ~2px): render via the editor's *display*
+model not raw `doc.line_str`. `widget::layout::display_rows` reuses `LineLayoutBuilder`
+per visual row (split by `wrap_map` `vlines`), flattening to `(display_text, fg,
+is_widget)` runs — hidden markers, heading styling, bullet/checkbox widgets render as the
+editor shows them; an N-row wrap occupies N minimap rows. Below ~2px → cheap per-line
+decimated path (only density reads). Heading rows are taller *and* wider: markdown emits
+`Line{height_scale}` + `Mark{font_scale}`, so each row recovers its font scale
+(`row_h / (line_h·scale)`) and widens advance by it. Atlas cell adapts to font
+(`cw≈advance`, `ch≈advance·1.7`) for ~1:1 blit when the doc fits; plain ink uses
+`color_plain` unmultiplied with a coverage contrast curve so small text doesn't wash out.
 
-**Uniform scale.** Bars keep the fit-to-height projection (fill the strip).
-Glyphs use `content_scale = min(strip_h/total_content, usable_w/wrap_width)`
-so wrapped rows fit the strip width without vertical stretching; a short doc's
-glyph strip occupies the top at true aspect. The chosen scale is computed once
-in `show` and shared by the texture and the live overlays (thumb / marks /
-press-to-scroll) so they stay aligned. The texture rebuild fingerprint folds
-in `total_content` + `wrap_map.width()`/`enabled()` so an editor-width reflow
-rebuilds the strip.
+**Uniform scale.** Bars: fit-to-height (fill the strip). Glyphs:
+`content_scale = min(strip_h/total_content, usable_w/wrap_width)` so wrapped rows fit the
+strip width without vertical stretch; short docs sit at the top at true aspect. Computed
+once in `show`, shared by texture + overlays so they stay aligned.
 
-**Overlays stay live (cheap, off-texture):** the viewport thumb, the
-selection / search marks, and all interaction (click/drag-to-scroll via
-`is_pointer_button_down_on`, wheel routed through `command::handle(Scroll)`)
-remain per-frame painter calls / event handling exactly as today — they
-depend on scroll position, so baking them into the texture would force a
-rebuild on every scroll frame.
+**Overlays stay live (off-texture):** viewport thumb, selection/search marks, interaction
+(click/drag-to-scroll via `is_pointer_button_down_on`, wheel via `command::handle(Scroll)`)
+stay per-frame — they depend on scroll position, so baking them in would force a rebuild
+every scroll frame.
 
-**Config & host wiring.** Add `style: MinimapStyle` to
-`minimap::Options`; host maps it from a new `MinimapConfig.style` field
-(`core/src/config/sections.rs`, default `glyphs`) in `to_minimap_options`
-(`app/src/panels/buffer/mod.rs`). The bar palette knobs stay; glyph mode
+**Config & host wiring.** Add `style: MinimapStyle` to `minimap::Options`; host maps it
+from a new `MinimapConfig.style` (`core/src/config/sections.rs`, default `glyphs`) in
+`to_minimap_options` (`app/src/panels/buffer/mod.rs`). Bar palette knobs stay; glyph mode
 ignores bar-specific ones.
 
-**Tests** (`editor-egui`): atlas downsample produces expected alpha for a
-known glyph box; the rebuild fingerprint moves iff one of its inputs moves
-(and *not* on a pure scroll); projection mapping matches the pre-rework
-`y_at_text`/`text_height` math; existing bar classification tests carry over.
-Pixel fidelity needs an in-app eyeball.
+**Tests** (`editor-egui`): atlas downsample alpha for a known glyph box; fingerprint moves
+iff an input moves (not on pure scroll); projection matches pre-rework
+`y_at_text`/`text_height`; bar classification tests carry over. Pixel fidelity needs an
+in-app eyeball.
 
 ---
 
