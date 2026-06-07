@@ -176,7 +176,7 @@ pub struct Widget<'a> {
     /// (transaction) behind every doc-mutating edit the widget applied from
     /// user input this frame — the forward half of the editor binding. The
     /// host drains it after `show` returns to mirror those edits into a
-    /// higher layer (e.g. a CRDT working layer). Selection-only edits, scroll,
+    /// higher layer (e.g. a `working` text layer). Selection-only edits, scroll,
     /// clicks, and no-op (identity) transactions push nothing. When `None`,
     /// transactions are simply not collected and behavior is unchanged.
     pub transactions_out: Option<&'a mut Vec<Transaction>>,
@@ -512,6 +512,17 @@ impl<'a> Widget<'a> {
         let mut viewport = self.view.visible_lines();
         let viewport_changed = (viewport.start, viewport.end) != cache.viewport;
 
+        // A metrics change (width / wrap-width / font / gutter) reflows the
+        // document: every line's height can change, so the height-map rebuild
+        // below would slide a *different* buffer line under the viewport top
+        // while `scroll_y` stays put — the reader's place jumps. Capture the
+        // line currently at the top NOW, against the not-yet-rebuilt height map
+        // and pre-rebuild scroll, then re-anchor to it after the rebuild. The
+        // most common trigger is opening / closing a side panel, which changes
+        // the editor's width and rewraps long lines.
+        let scroll_anchor =
+            metrics_changed.then(|| self.view.height_map.line_at_y(self.view.scroll_y));
+
         if !(metrics_changed || doc_changed || decos_changed || viewport_changed) {
             return MeasureOutcome::IDLE;
         }
@@ -606,6 +617,14 @@ impl<'a> Widget<'a> {
             phase_prof::record("  m.height", _t);
         }
 
+        // Heights are now current. If a metrics change reflowed the doc this
+        // frame, restore the pre-reflow top line so the resize doesn't jump the
+        // viewport. (`metrics_changed` implies `heights_dirty`, so the rebuild
+        // above has run and the height map's prefix is fresh.)
+        if let Some(line) = scroll_anchor {
+            command::anchor_scroll_to_line(self.view, line);
+        }
+
         // Viewport may have shifted as a result of the geometry rebuild
         // (heights changing under us). Re-read for the cache snapshot.
         viewport = self.view.visible_lines();
@@ -656,7 +675,7 @@ impl<'a> Widget<'a> {
             Action::Cut { text, state, tx } => {
                 ui.ctx().copy_text(text);
                 // Mirror the deletion to the host sink (same as `Replace`) so a
-                // CRDT `working` layer sees the cut; otherwise the reverse pass
+                // `working` text layer sees the cut; otherwise the reverse pass
                 // reverts it. Skip an identity change set (empty selection +
                 // empty line is conceivable).
                 if let Some(sink) = self.transactions_out.as_deref_mut() {

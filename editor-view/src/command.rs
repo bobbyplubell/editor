@@ -1134,6 +1134,19 @@ pub fn scroll_caret_into_view(state: &EditorState, view: &mut ViewState) {
     clamp_scroll(view);
 }
 
+/// Re-anchor the viewport so buffer line `line`'s top sits at the top of the
+/// visible band. Called by the widget's measure pass after a metrics change
+/// (width / wrap-width / font) rebuilds the height map: reflow changes each
+/// line's height, so leaving `scroll_y` untouched would slide a different line
+/// under the viewport top. Capturing the pre-reflow top line and restoring it
+/// here keeps the reader's place across a resize (e.g. opening / closing a
+/// sidebar). Expects the height map's prefix index to be current — the painter
+/// driver recomputes it at the end of the derivation that precedes this call.
+pub fn anchor_scroll_to_line(view: &mut ViewState, line: usize) {
+    view.scroll_y = view.height_map.y_at_line(line);
+    clamp_scroll(view);
+}
+
 /// Map widget-local (x, y) to a byte offset in the doc. `x` is widget-local
 /// (including gutter); the mapper subtracts the view's current content origin
 /// ([`ViewState::content_origin_x`]) — the gutter width with line numbers on,
@@ -1311,5 +1324,42 @@ mod tests {
         // honors the toggle rather than assuming a fixed gutter width.
         view.hide_gutter = false;
         assert_eq!(view_to_buffer_at_line(&state, &view, x, 0), 0);
+    }
+
+    /// A resize that reflows the document (e.g. a sidebar closing, which widens
+    /// the editor and unwraps long lines) shrinks the height of lines above the
+    /// viewport. Re-anchoring to the pre-reflow top line must put that line's
+    /// top back at the viewport top — not leave `scroll_y` at a stale pixel that
+    /// now lands on a different line. Regression for the resize line-jump.
+    #[test]
+    fn anchor_restores_top_line_after_reflow() {
+        let mut view = ViewState::default();
+        // 100 lines at 20px each.
+        view.height_map.sync_to_lines(100, 20.0);
+        view.height = 200.0;
+        view.scroll_past_end = 0.0;
+        // Lines 0..10 are each 3 visual rows tall while the editor is narrow
+        // (long lines wrapping). Top of line 30 therefore sits at
+        // 10*60 + 20*20 = 1000px. Scroll there.
+        for line in 0..10 {
+            view.height_map.set_line_height(line, 60.0);
+        }
+        view.height_map.recompute();
+        let top_line = view.height_map.line_at_y(view.height_map.y_at_line(30));
+        assert_eq!(top_line, 30);
+        view.scroll_y = view.height_map.y_at_line(30);
+
+        // Sidebar closes: the editor widens, those long lines now fit on one
+        // row, so the height map is rebuilt with uniform 20px rows. With the old
+        // behavior `scroll_y` (1000px) would now point at line 50, jumping the
+        // reader 20 lines down.
+        view.height_map.reset_text_heights();
+        view.height_map.recompute();
+        assert_eq!(view.height_map.line_at_y(view.scroll_y), 50, "precondition: stale scroll drifts");
+
+        // Re-anchoring to the captured top line snaps line 30 back to the top.
+        anchor_scroll_to_line(&mut view, top_line);
+        assert_eq!(view.scroll_y, view.height_map.y_at_line(30));
+        assert_eq!(view.height_map.line_at_y(view.scroll_y), 30);
     }
 }

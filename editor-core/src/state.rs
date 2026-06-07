@@ -333,7 +333,7 @@ impl Editor {
 
     /// Like [`undo`](Self::undo) but also returns the inverse change set that
     /// was applied, so a host binding can mirror the undo into a higher layer
-    /// (e.g. a CRDT `working` layer) instead of having the doc silently revert.
+    /// (e.g. a `working` text layer) instead of having the doc silently revert.
     /// Without this, an undo that only updates `editor.doc` is invisible to the
     /// binding and gets clobbered on the next reverse pass. Returns `None` when
     /// there is nothing to undo.
