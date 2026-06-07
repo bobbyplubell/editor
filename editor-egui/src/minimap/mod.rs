@@ -26,7 +26,7 @@ use egui::{
     Color32, CornerRadius, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 
-use editor_core::decoration::Decoration;
+use editor_core::decoration::{BlockPaint, BlockSide, Color, Decoration, TextAlign};
 use editor_core::state::Editor as EditorState;
 use editor_view::command;
 use editor_view::events::InputEvent;
@@ -54,6 +54,34 @@ fn content_scale(
         fit.min(usable / wrap_w)
     } else {
         fit
+    }
+}
+
+/// Aspect-preserving fit of a `w`×`h` image centered inside `region` (the
+/// minimap counterpart to the editor's letterbox blit, so a diagram keeps its
+/// proportions in the strip instead of stretching to the block's full box).
+fn fit_centered(region: Rect, w: f32, h: f32) -> Rect {
+    if w <= 0.0 || h <= 0.0 {
+        return region;
+    }
+    let k = (region.width() / w).min(region.height() / h);
+    let (fw, fh) = (w * k, h * k);
+    let c = region.center();
+    Rect::from_min_size(Pos2::new(c.x - fw * 0.5, c.y - fh * 0.5), Vec2::new(fw, fh))
+}
+
+/// Editor decoration color → egui premultiplied color (mirrors the widget
+/// painter's converter; duplicated here to keep the minimap self-contained).
+fn to_color(c: Color) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Resolve a text run's left edge from its `align` anchor + measured width.
+fn align_anchor(anchor_x: f32, width: f32, align: TextAlign) -> f32 {
+    match align {
+        TextAlign::Left => anchor_x,
+        TextAlign::Center => anchor_x - width * 0.5,
+        TextAlign::Right => anchor_x - width,
     }
 }
 
@@ -243,6 +271,39 @@ impl Accum {
                 // Contrast curve: lift mid-coverage so anti-aliased stems read
                 // as solid ink at minimap scale instead of washing out to grey.
                 self.fill(dx0, dy0, dx1, dy1, color, cov.powf(0.6));
+            }
+        }
+    }
+
+    /// Composite a straight-RGBA8 source image (`sw`×`sh`) into `rect`,
+    /// area-averaging on downscale. Each source texel is splatted into the
+    /// destination sub-rect it maps to and blended by per-pixel overlap, the
+    /// same coverage model [`Self::fill`] / [`Self::blit_glyph`] use — so a big
+    /// diagram shrinks cleanly into a few strip pixels. Source is straight
+    /// (un-premultiplied) RGBA; `from_rgba_unmultiplied` premultiplies it into
+    /// the accumulator's premultiplied space.
+    fn blit_rgba(&mut self, src: &[u8], sw: usize, sh: usize, rect: Rect) {
+        if sw == 0 || sh == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        if src.len() < sw * sh * 4 {
+            return;
+        }
+        let dw = rect.width();
+        let dh = rect.height();
+        for sy in 0..sh {
+            let dy0 = rect.top() + sy as f32 * dh / sh as f32;
+            let dy1 = rect.top() + (sy + 1) as f32 * dh / sh as f32;
+            for sx in 0..sw {
+                let i = (sy * sw + sx) * 4;
+                let a = src[i + 3];
+                if a == 0 {
+                    continue;
+                }
+                let color = Color32::from_rgba_unmultiplied(src[i], src[i + 1], src[i + 2], a);
+                let dx0 = rect.left() + sx as f32 * dw / sw as f32;
+                let dx1 = rect.left() + (sx + 1) as f32 * dw / sw as f32;
+                self.fill(dx0, dy0, dx1, dy1, color, 1.0);
             }
         }
     }
@@ -602,7 +663,135 @@ impl Raster<'_> {
         } else {
             self.render_bars(&mut acc, scale);
         }
+        // Diagram / widget thumbnails on top of the (hidden-source) gaps they
+        // occupy, so mermaid / math / wavedrom render in the strip instead of
+        // leaving blank space. Runs in both styles.
+        self.render_block_widgets(&mut acc, scale);
         acc.resolve(self.opts.color_background)
+    }
+
+    /// Draw every rendered block widget into the strip region its reserved
+    /// `Above` block occupies, so diagrams / tables show their real content
+    /// instead of a blank gap. A raster widget (mermaid, display math, wavedrom)
+    /// blits its cached pixels downscaled; a natively-painted widget (the pipe
+    /// table) replays its `paint_list` primitives — grid, cell fills, and text
+    /// glyphs — at strip scale, the same "legit glyphs" the body text uses.
+    /// Cheap: runs once per texture rebuild (never on pure scroll).
+    fn render_block_widgets(&self, acc: &mut Accum, scale: f32) {
+        let pad_l = self.opts.bar_padding_left * self.ppp;
+        let pad_r = self.opts.bar_padding_right * self.ppp;
+        let usable = (self.w as f32 - pad_l - pad_r).max(1.0);
+        let doc_len = self.state.doc.len_bytes();
+        // Content width the editor laid the native widget out at, so the
+        // thumbnail keeps the same aspect / wrapping the editor renders.
+        let content_w = {
+            let w = self.view.wrap_map.width();
+            if w > 1.0 { w } else { (self.w as f32 / scale.max(f32::EPSILON)).max(1.0) }
+        };
+        for layer in &self.view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(0..doc_len) {
+                let Decoration::BlockWidget { side, widget } = deco else { continue };
+                if *side != BlockSide::Above {
+                    continue;
+                }
+                let line = self.state.doc.byte_to_line(range.start.min(doc_len));
+                let block_h = self.view.height_map.block_above(line) * scale;
+                if block_h <= 0.5 {
+                    continue;
+                }
+                let top = self.view.height_map.y_at_row_top(line) * scale;
+                let region = Rect::from_min_size(Pos2::new(pad_l, top), Vec2::new(usable, block_h));
+                if let Some(px) = widget.pixels() {
+                    let fitted = fit_centered(region, px.width as f32, px.height as f32);
+                    acc.blit_rgba(px.rgba, px.width as usize, px.height as usize, fitted);
+                } else if let Some(list) = widget.paint_list(self.view.font_size, content_w) {
+                    let box_h = widget.measure(self.view.font_size, content_w).max(1.0);
+                    let fitted = fit_centered(region, content_w, box_h);
+                    self.replay_paint_list(acc, &list, fitted, content_w, box_h);
+                }
+            }
+        }
+    }
+
+    /// Replay a native-paint widget's primitives into `fitted` (the strip rect
+    /// the widget's `box_w`×`box_h` logical box maps to, aspect-preserved).
+    /// Rects/lines scale straight through; text runs render as atlas glyphs when
+    /// available (else a faint coverage bar for the bar style).
+    fn replay_paint_list(&self, acc: &mut Accum, list: &[BlockPaint], fitted: Rect, box_w: f32, box_h: f32) {
+        let k = (fitted.width() / box_w.max(1.0)).min(fitted.height() / box_h.max(1.0));
+        let (ox, oy) = (fitted.left(), fitted.top());
+        for prim in list {
+            match prim {
+                BlockPaint::Rect { x, y, w, h, color } => {
+                    acc.fill(ox + x * k, oy + y * k, ox + (x + w) * k, oy + (y + h) * k, to_color(*color), 1.0);
+                }
+                BlockPaint::Line { from, to, width, color } => {
+                    let (ax, ay) = (ox + from.0 * k, oy + from.1 * k);
+                    let (bx, by) = (ox + to.0 * k, oy + to.1 * k);
+                    let lw = (width * k).max(0.4);
+                    // Tables only emit axis-aligned rules: thicken the thin axis
+                    // into a fillable rect.
+                    let (x0, y0, x1, y1) = if (by - ay).abs() <= (bx - ax).abs() {
+                        let cy = (ay + by) * 0.5;
+                        (ax.min(bx), cy - lw * 0.5, ax.max(bx), cy + lw * 0.5)
+                    } else {
+                        let cx = (ax + bx) * 0.5;
+                        (cx - lw * 0.5, ay.min(by), cx + lw * 0.5, ay.max(by))
+                    };
+                    acc.fill(x0, y0, x1, y1, to_color(*color), 1.0);
+                }
+                BlockPaint::Text { x, y, text, color, font_scale, align } => {
+                    self.blit_text_run(acc, ox + x * k, oy + y * k, k, text, to_color(*color), *font_scale, *align);
+                }
+            }
+        }
+    }
+
+    /// Lay one text run left-to-right at strip scale. `anchor_x` is the run's
+    /// `align` anchor already in strip pixels; `top_y` its box top. With an atlas
+    /// each glyph blits its coverage cell (decimated when sub-pixel, like the
+    /// body-text path); without one (bar style) the run is a single faint bar.
+    fn blit_text_run(
+        &self,
+        acc: &mut Accum,
+        anchor_x: f32,
+        top_y: f32,
+        k: f32,
+        text: &str,
+        color: Color32,
+        font_scale: f32,
+        align: TextAlign,
+    ) {
+        let cell_h = (self.line_h * font_scale * k).max(0.5);
+        let Some(atlas) = self.atlas else {
+            let adv = self.line_h * font_scale * 0.5 * k;
+            let w = adv * text.chars().count() as f32;
+            let lx = align_anchor(anchor_x, w, align);
+            acc.fill(lx, top_y, lx + w, top_y + cell_h, color, 0.4);
+            return;
+        };
+        let adv = (atlas.advance * font_scale * k).max(0.02);
+        let col_step = if adv < 1.0 { (1.0 / adv).floor().max(1.0) as usize } else { 1 };
+        let cw_eff = adv * col_step as f32;
+        let total_w = adv * text.chars().count() as f32;
+        let lx = align_anchor(anchor_x, total_w, align);
+        let mut col = 0usize;
+        for ch in text.chars() {
+            if col % col_step != 0 {
+                col += 1;
+                continue;
+            }
+            let gx = lx + col as f32 * adv;
+            col += 1;
+            if ch == ' ' || ch == '\t' {
+                continue;
+            }
+            let r = Rect::from_min_size(Pos2::new(gx, top_y), Vec2::new(cw_eff, cell_h));
+            match atlas.coverage(ch) {
+                Some(sp) => acc.blit_glyph(sp, [atlas.cw, atlas.ch], r, color),
+                None => acc.fill(r.left(), r.top(), r.right(), r.bottom(), color, 0.45),
+            }
+        }
     }
 
     /// Left gutter rule; the background fill itself is applied in `resolve`.

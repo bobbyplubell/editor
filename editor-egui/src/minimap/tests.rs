@@ -1,15 +1,18 @@
 use super::{
-    classify_lines, compute_marks, marks_signature, measure_lines, options_signature,
-    resolve_line_colors, Accum, Cache, LineKind, Options, Style,
+    classify_lines, compute_marks, fit_centered, marks_signature, measure_lines,
+    options_signature, resolve_line_colors, Accum, Cache, LineKind, Options, Raster, Style,
 };
 use super::atlas::{rasterize_glyph_cell, CellGeom, GlyphMetric};
-use editor_core::decoration::{Color, Decoration, MarkStyle};
+use editor_core::decoration::{
+    BlockPaint, BlockSide, BlockWidget, Color, Decoration, MarkStyle, WidgetPixels,
+};
 use editor_core::rangeset::RangeSet;
 use editor_core::state::Editor as EditorState;
 use editor_view::command;
 use editor_view::events::InputEvent;
 use editor_view::viewport::ViewState;
-use egui::{Color32, ColorImage, Rect, Vec2};
+use egui::{Color32, ColorImage, Pos2, Rect, Vec2};
+use std::sync::Arc;
 
 fn heading_layer(view: &mut ViewState, range: std::ops::Range<usize>) {
     let deco = Decoration::Mark(MarkStyle { bold: true, ..Default::default() });
@@ -142,6 +145,150 @@ fn options_signature_tracks_style_and_palette() {
     assert_eq!(options_signature(&glyphs), options_signature(&Options::default()));
     let recolored = Options { color_heading: Color32::RED, ..Default::default() };
     assert_ne!(options_signature(&recolored), options_signature(&Options::default()));
+}
+
+// ── Diagram / block-widget thumbnail tests ────────────────────────────────
+
+/// A block widget that exposes a solid-color raster, for testing the minimap's
+/// diagram-thumbnail blit without pulling in the app's real render pipeline.
+struct FakePixelWidget {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+impl BlockWidget for FakePixelWidget {
+    fn measure(&self, _font_size: f32, _width: f32) -> f32 {
+        self.h as f32
+    }
+    fn pixels(&self) -> Option<WidgetPixels<'_>> {
+        Some(WidgetPixels { rgba: &self.rgba, width: self.w, height: self.h })
+    }
+}
+
+#[test]
+fn fit_centered_preserves_aspect_and_centers() {
+    let region = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
+    // 2:1 image is width-limited → fills 40×20 exactly.
+    let wide = fit_centered(region, 2.0, 1.0);
+    assert!((wide.width() - 40.0).abs() < 0.01 && (wide.height() - 20.0).abs() < 0.01);
+    // 1:1 image is height-limited → 20×20, centered horizontally in the strip.
+    let square = fit_centered(region, 1.0, 1.0);
+    assert!((square.width() - 20.0).abs() < 0.01 && (square.height() - 20.0).abs() < 0.01);
+    assert!((square.center().x - region.center().x).abs() < 0.01);
+}
+
+#[test]
+fn blit_rgba_fills_region_with_source_color() {
+    let mut acc = Accum::new(4, 4);
+    // 2×2 solid opaque blue, downscaled-equal into the whole 4×4 buffer.
+    let src = vec![0u8, 0, 255, 255].repeat(4);
+    acc.blit_rgba(&src, 2, 2, Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(4.0, 4.0)));
+    let img = acc.resolve(Color32::from_rgba_premultiplied(0, 0, 0, 0));
+    let p = img.pixels[1 * 4 + 1];
+    assert!(p.b() > 200 && p.r() < 50 && p.g() < 50, "blit carries source color: {p:?}");
+    assert!(p.a() > 200, "blit carries source opacity: {p:?}");
+}
+
+/// A native-paint block widget (like the pipe table): no raster, just a
+/// `paint_list`. Here a single full-box filled rect of `color`.
+struct FakePaintWidget {
+    h: f32,
+    color: Color,
+}
+
+impl BlockWidget for FakePaintWidget {
+    fn measure(&self, _font_size: f32, _width: f32) -> f32 {
+        self.h
+    }
+    fn paint_list(&self, _font_size: f32, width: f32) -> Option<Vec<BlockPaint>> {
+        Some(vec![BlockPaint::Rect { x: 0.0, y: 0.0, w: width, h: self.h, color: self.color }])
+    }
+}
+
+#[test]
+fn native_paint_widget_replays_into_strip_region() {
+    // A table-like widget (paint_list, no pixels) must render its real
+    // primitives in the strip — not a flat placeholder block.
+    let state = EditorState::new("intro\nTABLE\nmore\n");
+    let mut view = ViewState::default();
+    view.height_map.sync_to_lines(3, view.line_height);
+    view.height_map.add_block_above(1, 40.0);
+    view.height_map.recompute();
+
+    let line1 = state.doc.line_to_byte(1);
+    let green = Color::rgba(0, 200, 0, 255);
+    let widget: Arc<dyn BlockWidget> = Arc::new(FakePaintWidget { h: 40.0, color: green });
+    view.decorations.push_with_heights(RangeSet::from_iter([(
+        line1..line1 + 1,
+        Decoration::BlockWidget { side: BlockSide::Above, widget },
+    )]));
+
+    let opts = Options::default();
+    let kinds = classify_lines(&state, &view);
+    let metrics = measure_lines(&state);
+    let raster = Raster {
+        state: &state,
+        view: &view,
+        opts: &opts,
+        kinds: &kinds,
+        metrics: &metrics,
+        atlas: None,
+        w: 40,
+        h: 120,
+        ppp: 1.0,
+        scale_px: 1.0,
+        line_h: view.line_height,
+    };
+    let img = raster.run();
+    let p = img.pixels[38 * 40 + 20];
+    assert!(p.g() > 150 && p.r() < 80 && p.b() < 80, "table primitives replayed in green: {p:?}");
+}
+
+#[test]
+fn block_widget_thumbnail_drawn_in_its_strip_region() {
+    // doc: line0 text, line1 anchors a tall diagram block, line2 text.
+    let state = EditorState::new("intro\nFENCE\nmore\n");
+    let mut view = ViewState::default();
+    view.height_map.sync_to_lines(3, view.line_height);
+    // Reserve a 40 px Above-block on line 1 (the diagram's footprint).
+    view.height_map.add_block_above(1, 40.0);
+    view.height_map.recompute();
+
+    let line1 = state.doc.line_to_byte(1);
+    // Solid opaque red 4×4 raster.
+    let widget: Arc<dyn BlockWidget> = Arc::new(FakePixelWidget {
+        rgba: vec![255u8, 0, 0, 255].repeat(16),
+        w: 4,
+        h: 4,
+    });
+    view.decorations.push_with_heights(RangeSet::from_iter([(
+        line1..line1 + 1,
+        Decoration::BlockWidget { side: BlockSide::Above, widget },
+    )]));
+
+    let opts = Options::default();
+    let kinds = classify_lines(&state, &view);
+    let metrics = measure_lines(&state);
+    // 1 content-px → 1 strip-px so the geometry maps straight through.
+    let raster = Raster {
+        state: &state,
+        view: &view,
+        opts: &opts,
+        kinds: &kinds,
+        metrics: &metrics,
+        atlas: None,
+        w: 40,
+        h: 120,
+        ppp: 1.0,
+        scale_px: 1.0,
+        line_h: view.line_height,
+    };
+    let img = raster.run();
+    // The block occupies content y∈[18,58]; its center (~y=38) inside the strip
+    // width should carry the red thumbnail, not the empty background.
+    let p = img.pixels[38 * 40 + 20];
+    assert!(p.r() > 150 && p.g() < 80 && p.b() < 80, "diagram thumbnail painted red: {p:?}");
 }
 
 // ── Mark-strip cache tests ────────────────────────────────────────────────
