@@ -958,6 +958,105 @@ impl HeightMap {
     }
 }
 
+/// Why the measure pass wants to pin the top-of-viewport line across a height
+/// rebuild. Both variants drive the *same* fix — capture the line currently at
+/// the viewport top against the old height map, then re-anchor `scroll_y` to it
+/// after the rebuild so the rebuild doesn't slide a different line under the
+/// top. The variants exist only to name the two distinct triggers (and to keep
+/// the predicate unit-testable without an egui frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorTrigger {
+    /// Width / wrap-width / font / gutter changed (e.g. a side panel opened),
+    /// reflowing every line.
+    Metrics,
+    /// A height decoration changed with no document edit — a "reveal" toggle:
+    /// clicking into a rendered diagram/widget fence flips it from a tall block
+    /// to its raw source. The height of a region changes while the document
+    /// content is byte-identical.
+    Reveal,
+}
+
+impl AnchorTrigger {
+    /// Decide whether (and why) to anchor the viewport this measure pass.
+    ///
+    /// `Metrics` wins when the layout metrics changed. Otherwise a height
+    /// decoration change with NO document edit (`decos_changed && !doc_changed`)
+    /// is a reveal toggle and earns `Reveal`. On a document edit (`doc_changed`)
+    /// we return `None` so the caret-into-view pass owns scroll instead — pinning
+    /// the top there would fight the "keep the caret visible after typing" rule.
+    #[must_use]
+    pub const fn detect(metrics_changed: bool, decos_changed: bool, doc_changed: bool) -> Option<Self> {
+        if metrics_changed {
+            Some(Self::Metrics)
+        } else if decos_changed && !doc_changed {
+            Some(Self::Reveal)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod anchor_trigger_tests {
+    use super::AnchorTrigger;
+
+    #[test]
+    fn metrics_change_anchors_as_metrics() {
+        // A side-panel open changes width: anchor to keep the reader's place.
+        assert_eq!(
+            AnchorTrigger::detect(true, false, false),
+            Some(AnchorTrigger::Metrics)
+        );
+    }
+
+    #[test]
+    fn reveal_toggle_anchors_as_reveal() {
+        // Clicking into a diagram: height decorations change, doc does not.
+        assert_eq!(
+            AnchorTrigger::detect(false, true, false),
+            Some(AnchorTrigger::Reveal)
+        );
+    }
+
+    #[test]
+    fn reveal_collapse_anchors_too() {
+        // Clicking OUT of a diagram is the same shape (decos flip, doc stable),
+        // so the collapse back to the rendered widget must also not jump.
+        assert_eq!(
+            AnchorTrigger::detect(false, true, false),
+            Some(AnchorTrigger::Reveal)
+        );
+    }
+
+    #[test]
+    fn edit_that_changes_height_does_not_anchor() {
+        // Typing a `#` to make a heading changes height decorations AND the doc.
+        // The caret-into-view pass owns scroll on edit frames, so no anchor.
+        assert_eq!(AnchorTrigger::detect(false, true, true), None);
+    }
+
+    #[test]
+    fn plain_edit_does_not_anchor() {
+        assert_eq!(AnchorTrigger::detect(false, false, true), None);
+    }
+
+    #[test]
+    fn pure_scroll_does_not_anchor() {
+        // No metrics, deco, or doc change (a scroll-only frame): nothing to pin.
+        assert_eq!(AnchorTrigger::detect(false, false, false), None);
+    }
+
+    #[test]
+    fn metrics_wins_over_reveal_when_both_change() {
+        // A resize that also flips a reveal still anchors (Metrics takes the
+        // label); the behaviour is identical either way.
+        assert_eq!(
+            AnchorTrigger::detect(true, true, false),
+            Some(AnchorTrigger::Metrics)
+        );
+    }
+}
+
 #[cfg(test)]
 mod height_map_tests {
     use super::HeightMap;

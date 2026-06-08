@@ -743,6 +743,15 @@ impl Raster<'_> {
                 BlockPaint::Text { x, y, text, color, font_scale, align } => {
                     self.blit_text_run(acc, ox + x * k, oy + y * k, k, text, to_color(*color), *font_scale, *align);
                 }
+                BlockPaint::RichText { x, y, runs, align, .. } => {
+                    // The minimap is a coverage glance, not a wrap-faithful
+                    // render: blit the concatenated run text (markers already
+                    // stripped) as one left-to-right run at strip scale, taking
+                    // the first run's color as representative.
+                    let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+                    let color = runs.first().map_or(Color32::GRAY, |r| to_color(r.color));
+                    self.blit_text_run(acc, ox + x * k, oy + y * k, k, &joined, color, 1.0, *align);
+                }
             }
         }
     }

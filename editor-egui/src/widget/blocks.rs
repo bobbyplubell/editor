@@ -29,7 +29,9 @@ use editor_core::decoration::TextAlign;
 use editor_view::viewport::ClickAction;
 use editor_view::viewport::ClickRect;
 use editor_view::viewport::ClickZone;
-use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke};
+use editor_core::decoration::StyledRun;
+use egui::text::LayoutJob;
+use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke, TextFormat};
 
 use super::to_egui_color;
 
@@ -263,7 +265,80 @@ impl<'a> BlockPaint<'a> {
                     self.painter
                         .galley(Pos2::new(left_x, origin.y + y), galley, fg);
                 }
+                CorePaint::RichText { x, y, runs, max_width, align } => {
+                    self.paint_rich_text(origin, *x, *y, runs, *max_width, *align);
+                }
             }
+        }
+    }
+
+    /// Lay a sequence of [`StyledRun`]s out as a single wrapping galley (one
+    /// `LayoutJob` with a `TextFormat` section per run) and paint it anchored at
+    /// `(x, y)` (widget-box-relative) wrapped to `max_width`, horizontally
+    /// aligned by `align` against `max_width`. The per-run inline-code
+    /// background box is painted behind the resolved glyph rows.
+    fn paint_rich_text(
+        &self,
+        origin: Pos2,
+        x: f32,
+        y: f32,
+        runs: &[StyledRun],
+        max_width: f32,
+        align: TextAlign,
+    ) {
+        let galley = self.ui.fonts(|f| f.layout_job(self.rich_job(runs, max_width, false)));
+        let anchor_x = origin.x + x;
+        let left_x = match align {
+            TextAlign::Left => anchor_x,
+            TextAlign::Center => anchor_x + (max_width - galley.size().x).max(0.0) * 0.5,
+            TextAlign::Right => anchor_x + (max_width - galley.size().x).max(0.0),
+        };
+        let fg = self.ui.visuals().text_color();
+        let pos = Pos2::new(left_x, origin.y + y);
+        self.painter.galley(pos, galley, fg);
+        // Faux-bold: egui has no per-section weight and the app registers no
+        // bold family, so re-paint a galley identical in layout but with only
+        // the bold runs visible (others transparent), shifted 0.5px — the same
+        // double-paint idiom the main text layout uses. Identical text/wrap →
+        // the rows line up exactly. Skip the extra galley when no run is bold.
+        if runs.iter().any(|r| r.bold) {
+            let bold = self.ui.fonts(|f| f.layout_job(self.rich_job(runs, max_width, true)));
+            self.painter.galley(Pos2::new(pos.x + 0.5, pos.y), bold, fg);
+        }
+    }
+
+    /// Build the wrapping [`LayoutJob`] for a rich-text block: one
+    /// [`TextFormat`] section per [`StyledRun`], wrapped to `max_width`. When
+    /// `bold_only`, every non-bold run is forced transparent so the resulting
+    /// galley (laid out identically) overlays only the bold glyphs for the
+    /// faux-bold double-paint.
+    fn rich_job(&self, runs: &[StyledRun], max_width: f32, bold_only: bool) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = max_width.max(1.0);
+        for run in runs {
+            job.append(&run.text, 0.0, self.run_format(run, bold_only));
+        }
+        job
+    }
+
+    /// Map a [`StyledRun`]'s style flags to an egui [`TextFormat`] section. When
+    /// `bold_only`, non-bold runs render transparent (the faux-bold overlay).
+    fn run_format(&self, run: &StyledRun, bold_only: bool) -> TextFormat {
+        let family = if run.code { FontFamily::Monospace } else { FontFamily::Proportional };
+        let visible = !bold_only || run.bold;
+        let color = if visible { to_egui_color(run.color) } else { Color32::TRANSPARENT };
+        let line = |on: bool| if on && visible { Stroke::new(1.0, color) } else { Stroke::NONE };
+        TextFormat {
+            font_id: FontId::new(self.font_size, family),
+            color,
+            background: match run.bg {
+                Some(bg) if !bold_only => to_egui_color(bg),
+                _ => Color32::TRANSPARENT,
+            },
+            italics: run.italic,
+            strikethrough: line(run.strike),
+            underline: line(run.underline),
+            ..Default::default()
         }
     }
 

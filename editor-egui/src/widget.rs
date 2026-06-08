@@ -13,6 +13,7 @@ use editor_core::decoration::LineStyle;
 
 use editor_view::command;
 use editor_view::command::Action;
+use editor_view::viewport::AnchorTrigger;
 use editor_view::viewport::DragState;
 use editor_view::viewport::MeasureCache;
 use editor_view::viewport::ClickAction;
@@ -520,8 +521,22 @@ impl<'a> Widget<'a> {
         // and pre-rebuild scroll, then re-anchor to it after the rebuild. The
         // most common trigger is opening / closing a side panel, which changes
         // the editor's width and rewraps long lines.
-        let scroll_anchor =
-            metrics_changed.then(|| self.view.height_map.line_at_y(self.view.scroll_y));
+        //
+        // The *same* class of jump happens on a "reveal" toggle: clicking into a
+        // rendered diagram/widget fence (mermaid / wavedrom / chart / math / a
+        // pipe table) flips it from a tall `BlockWidget` to its (usually shorter)
+        // raw source — the cursor moving INTO the fence drops its `hide` line
+        // decorations and removes the block. That changes a line's height with no
+        // edit to the document, so the height decoration signature changes while
+        // the doc content id does not (`decos_changed && !doc_changed`). Without
+        // an anchor the height delta above the viewport top shifts everything
+        // below it; with one, the line at the top of the viewport stays put and
+        // only the fence's own region grows/shrinks below the anchor — the reader
+        // doesn't move. (On an edit frame `doc_changed` is set and the caret-into-
+        // view pass owns scroll, so reveal anchoring deliberately stands down
+        // there.)
+        let scroll_anchor = AnchorTrigger::detect(metrics_changed, decos_changed, doc_changed)
+            .map(|_| self.view.height_map.line_at_y(self.view.scroll_y));
 
         if !(metrics_changed || doc_changed || decos_changed || viewport_changed) {
             return MeasureOutcome::IDLE;
@@ -617,10 +632,12 @@ impl<'a> Widget<'a> {
             phase_prof::record("  m.height", _t);
         }
 
-        // Heights are now current. If a metrics change reflowed the doc this
-        // frame, restore the pre-reflow top line so the resize doesn't jump the
-        // viewport. (`metrics_changed` implies `heights_dirty`, so the rebuild
-        // above has run and the height map's prefix is fresh.)
+        // Heights are now current. If a metrics change reflowed the doc OR a
+        // reveal toggle changed a fence's height this frame, restore the pre-
+        // rebuild top line so the change doesn't jump the viewport. (Both
+        // triggers — see `AnchorTrigger::detect` — imply `heights_dirty`
+        // [`metrics_changed` / `decos_changed`], so the rebuild above has run and
+        // the height map's prefix is fresh.)
         if let Some(line) = scroll_anchor {
             command::anchor_scroll_to_line(self.view, line);
         }

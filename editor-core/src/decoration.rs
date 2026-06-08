@@ -155,6 +155,47 @@ pub enum TextAlign {
     Right,
 }
 
+/// One styled inline run within a [`BlockPaint::RichText`]: a contiguous slice
+/// of text plus the per-run style flags the painter turns into an egui
+/// `TextFormat` section. The text carries no markup — the inline markdown
+/// markers (`**`, `*`, `` ` ``, `~~`) are already stripped by the producer, so
+/// the painter renders exactly `text` with the requested style.
+///
+/// Deliberately egui-free (plain fields + [`Color`]): `editor-core` never names
+/// a font or `TextFormat`. The host (`editor-egui`) maps each run to a format
+/// section of a single wrapping `LayoutJob`. Used by the table widget to render
+/// inline markdown inside cells (`widget-table-render`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyledRun {
+    pub text: SmolStr,
+    pub color: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub underline: bool,
+    /// Render in a monospace family with a faint background box (inline code).
+    pub code: bool,
+    /// Optional run background (e.g. the inline-code box). `None` = transparent.
+    pub bg: Option<Color>,
+}
+
+impl StyledRun {
+    /// A plain (unstyled) run carrying just `text` in `color`. Convenience for
+    /// the common case; flags default to off.
+    pub fn plain(text: impl Into<SmolStr>, color: Color) -> Self {
+        Self {
+            text: text.into(),
+            color,
+            bold: false,
+            italic: false,
+            strike: false,
+            underline: false,
+            code: false,
+            bg: None,
+        }
+    }
+}
+
 /// One retained native-paint primitive: plain geometry + style in **logical
 /// points**, no egui or GPU types. A [`BlockWidget`] returns a list of these
 /// from [`paint_list`](BlockWidget::paint_list) and the `editor-egui` painter
@@ -183,6 +224,19 @@ pub enum BlockPaint {
         text: SmolStr,
         color: Color,
         font_scale: f32,
+        align: TextAlign,
+    },
+    /// A wrapping rich-text block: a sequence of [`StyledRun`]s laid out as a
+    /// single multi-format galley wrapped to `max_width` (logical points), the
+    /// whole block anchored at `(x, y)` (top-left) and horizontally aligned by
+    /// `align` against `max_width`. The host builds one egui `LayoutJob` with a
+    /// format section per run (so a `**bold** *italic*` cell wraps as one
+    /// paragraph with per-run style). Used by table cells (`widget-table-render`).
+    RichText {
+        x: f32,
+        y: f32,
+        runs: Vec<StyledRun>,
+        max_width: f32,
         align: TextAlign,
     },
 }

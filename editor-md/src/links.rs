@@ -77,6 +77,23 @@ impl InlineWidget for WikilinkWidget {
     }
 }
 
+/// True when a markdown-link destination leaves the vault — `http(s)://`,
+/// `mailto:`, or a `zim://` archive reference. Such links keep the standard
+/// markdown decoration (styled label, OS-open handled elsewhere) and are NOT
+/// turned into clickable note pills here. Vault-shaped destinations (a bare
+/// name, a relative path, or one with a `#section` anchor) fall through and
+/// become clickable pills resolved against the index. Mirrors the precedence
+/// in `core::url::classify` but stays a pure local check so `editor-md` keeps
+/// no dependency on `hiker-core`. status: markdown-link-vault-nav
+#[must_use]
+pub fn is_external_link_dest(dest: &str) -> bool {
+    let lower = dest.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("zim://")
+}
+
 pub fn wikilink_decorations(
     state: &EditorState,
     theme: Option<&Theme>,
@@ -99,6 +116,25 @@ pub fn wikilink_decorations(
     };
     let mut i = scan_start;
     while i + 1 < scan_end {
+        // Markdown link `[text](dest)` whose dest is a vault target becomes a
+        // clickable note pill, sharing the wikilink click path. An external
+        // dest is left to the standard markdown decoration. A `[[` opens the
+        // wikilink branch below, so require the next byte to NOT be `[`.
+        if bytes[i] == b'['
+            && bytes[i + 1] != b'['
+            && (i == 0 || bytes[i - 1] != b'[')
+            && let Some(md) = parse_md_link(&text, i)
+            && !is_external_link_dest(&md.dest)
+        {
+            let span_line_start = line_of(i);
+            let span_line_end = line_of(md.full_end.saturating_sub(1).max(i));
+            let on_cursor = cursor_line >= span_line_start && cursor_line <= span_line_end;
+            if !on_cursor {
+                emit_md_link_pill(&mut entries, &md, i, link_color, resolve);
+            }
+            i = md.full_end;
+            continue;
+        }
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
             // Find closing `]]` on the same logical span (no newlines inside).
             let mut j = i + 2;
@@ -205,4 +241,168 @@ pub fn wikilink_decorations(
 /// Faint pill background tinted from the link color (low alpha).
 const fn pill_bg(c: Color) -> Color {
     Color::rgba(c.r, c.g, c.b, 36)
+}
+
+/// A parsed `[label](dest)` markdown link on a single line. Byte offsets are
+/// absolute in the document; `dest` is the destination text (a vault path or
+/// name, possibly with a `#section` anchor) verbatim.
+struct MdLink {
+    /// Display text between the `[` and `]`.
+    label: String,
+    /// Destination between the `(` and `)`.
+    dest: String,
+    /// Byte offset just past the closing `)`.
+    full_end: usize,
+}
+
+/// Parse a `[label](dest)` markdown link whose opening `[` is at byte `start`.
+/// Returns `None` when the bytes there are not a well-formed inline link on one
+/// line (no nested `]`/`)`, no newline inside, label and dest both present).
+fn parse_md_link(text: &str, start: usize) -> Option<MdLink> {
+    let rest = &text[start..];
+    let bytes = rest.as_bytes();
+    // `[` … `]` label (no newline, no nested `]`).
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut k = 1;
+    while k < bytes.len() && bytes[k] != b']' && bytes[k] != b'\n' {
+        k += 1;
+    }
+    if k >= bytes.len() || bytes[k] != b']' {
+        return None;
+    }
+    let label = &rest[1..k];
+    // Immediately followed by `(` … `)` dest.
+    if bytes.get(k + 1) != Some(&b'(') {
+        return None;
+    }
+    let dest_start = k + 2;
+    let mut m = dest_start;
+    while m < bytes.len() && bytes[m] != b')' && bytes[m] != b'\n' {
+        m += 1;
+    }
+    if m >= bytes.len() || bytes[m] != b')' {
+        return None;
+    }
+    let dest = &rest[dest_start..m];
+    if dest.trim().is_empty() {
+        return None;
+    }
+    Some(MdLink {
+        label: label.to_string(),
+        dest: dest.to_string(),
+        full_end: start + m + 1,
+    })
+}
+
+/// Emit a clickable pill replacing a vault-target markdown link's whole span.
+/// The pill's label is the link's own `[label]` text (markdown links carry
+/// their display text directly, unlike wikilinks which resolve a title).
+/// The click id is `WIKILINK_WIDGET_TAG | start`, so the shared wikilink click
+/// handler re-parses the link at `start` and resolves the dest.
+/// status: markdown-link-vault-nav
+fn emit_md_link_pill(
+    entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
+    md: &MdLink,
+    start: usize,
+    link_color: Color,
+    resolve: Option<&TitleResolver<'_>>,
+) {
+    let label = md.label.trim();
+    let label = if label.is_empty() { md.dest.trim() } else { label };
+    // Resolution drives only the color: a dest the index can't place renders in
+    // the unresolved style, matching wikilink behavior. The page part (before
+    // any `#section`) is what the resolver checks.
+    let page = md.dest.split('#').next().unwrap_or(&md.dest).trim();
+    let resolved = resolve.is_none_or(|r| r(page).is_some());
+    let (fg, bg) = if resolved {
+        (link_color, Some(pill_bg(link_color)))
+    } else {
+        (COLOR_WIKILINK_UNRESOLVED, None)
+    };
+    entries.push((
+        start..md.full_end,
+        Decoration::InlineWidget {
+            widget: Arc::new(WikilinkWidget {
+                text: SmolStr::from(label),
+                fg,
+                bg,
+                id: WIKILINK_WIDGET_TAG | start as u64,
+            }),
+            atomic: true,
+        },
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_dests_are_recognized() {
+        assert!(is_external_link_dest("http://example.com"));
+        assert!(is_external_link_dest("HTTPS://Example.com"));
+        assert!(is_external_link_dest("mailto:a@b.c"));
+        assert!(is_external_link_dest("zim://zim/C/Foo"));
+        assert!(!is_external_link_dest("Note"));
+        assert!(!is_external_link_dest("folder/Note.md"));
+        assert!(!is_external_link_dest("Note#Heading"));
+        assert!(!is_external_link_dest("#Section"));
+    }
+
+    #[test]
+    fn parses_inline_markdown_link() {
+        let text = "see [Doc](folder/Doc#Heading) end";
+        let start = text.find('[').unwrap();
+        let md = parse_md_link(text, start).expect("link parses");
+        assert_eq!(md.label, "Doc");
+        assert_eq!(md.dest, "folder/Doc#Heading");
+        assert_eq!(&text[start..md.full_end], "[Doc](folder/Doc#Heading)");
+    }
+
+    #[test]
+    fn rejects_malformed_markdown_link() {
+        assert!(parse_md_link("[Doc] (x)", 0).is_none());
+        assert!(parse_md_link("[Doc]\n(x)", 0).is_none());
+        assert!(parse_md_link("[Doc]()", 0).is_none());
+        assert!(parse_md_link("[Doc](no\nclose", 0).is_none());
+    }
+
+    /// Decorations produced with the caret at offset 0, so off-cursor links
+    /// collapse to pills. The resolver maps every page to a title (resolved).
+    fn pill_targets(src: &str) -> Vec<u64> {
+        let state = EditorState::new(src);
+        let resolve = |_: &str| Some("Title".to_string());
+        let set = wikilink_decorations(&state, None, None, Some(&resolve));
+        set.iter_all()
+            .filter_map(|(_, d)| match d {
+                Decoration::InlineWidget { widget, .. } => Some(widget.widget_id()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vault_markdown_link_becomes_clickable_pill() {
+        // Cursor at 0; the link is on its own (later) line so it's off-cursor.
+        let src = "x\n[Doc](folder/Doc#Heading)\n";
+        let ids = pill_targets(src);
+        assert_eq!(ids.len(), 1, "one pill emitted for the vault link");
+        assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0, "tagged as a wikilink-bucket click");
+    }
+
+    #[test]
+    fn external_markdown_link_is_not_a_pill() {
+        let src = "x\n[Site](https://example.com)\n";
+        assert!(pill_targets(src).is_empty(), "external link stays a plain markdown link");
+    }
+
+    #[test]
+    fn wikilink_still_emits_its_pill() {
+        let src = "x\n[[Other#Heading]]\n";
+        let ids = pill_targets(src);
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0);
+    }
 }

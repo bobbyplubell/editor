@@ -591,9 +591,15 @@ impl<'a> MdScan<'a> {
                     }
                 }
             }
-            Tag::Link { .. } => {
+            Tag::Link { dest_url, .. } => {
                 // [label](url) — style the label, hide the brackets/url.
-                if let Some(label_range) = self.find_link_label(&span) {
+                // A vault-target link (non-external dest) is instead rendered as
+                // a clickable note pill by the wikilink decoration layer
+                // (`markdown-link-vault-nav`); skip it here so the two layers
+                // don't both decorate the same span.
+                if crate::links::is_external_link_dest(dest_url.as_ref())
+                    && let Some(label_range) = self.find_link_label(&span)
+                {
                     let link = self.pal.link;
                     self.entries.push((
                         label_range.clone(),
