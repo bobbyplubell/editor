@@ -27,6 +27,7 @@ use editor_core::rangeset::RangeSet;
 use editor_core::theme::Theme;
 pub const COLOR_MERMAID_BG: Color = Color::rgba(120, 200, 180, 28);
 pub const COLOR_WAVEDROM_BG: Color = Color::rgba(200, 170, 120, 28);
+pub const COLOR_CHART_BG: Color = Color::rgba(140, 170, 220, 28);
 
 /// A detected ```` ```mermaid ```` fenced block: the full source byte range
 /// (fence lines inclusive) and the inner range (the diagram source between the
@@ -46,6 +47,17 @@ pub struct MermaidSpan {
 /// for the WaveDrom widget (`widget-wavedrom-render`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaveDromSpan {
+    pub byte_range: std::ops::Range<usize>,
+    pub inner_range: std::ops::Range<usize>,
+}
+
+/// A detected ```` ```chart ```` fenced block — same shape as [`MermaidSpan`]
+/// (full byte range + inner chart-block source range). The inner source is a
+/// `hiker-charts` block body: a YAML config, optionally followed by a `---` line
+/// and inline CSV. The renderer-facing output for the chart widget
+/// (`widget-chart-render`); the `app` layer turns each span into a `BlockWidget`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChartSpan {
     pub byte_range: std::ops::Range<usize>,
     pub inner_range: std::ops::Range<usize>,
 }
@@ -201,6 +213,21 @@ pub fn wavedrom_spans(
         .collect()
 }
 
+/// Scan the document (viewport-scoped) for ```` ```chart ```` fenced blocks,
+/// reporting each fence's byte range and the inner chart-block source range so
+/// the `app` layer can parse + render it to a `BlockWidget`. The inner range is
+/// the whole block body (YAML config plus an optional `---` + inline CSV), which
+/// the host hands to `hiker_charts_core::block::parse_block`. status: widget-chart-render
+pub fn chart_spans(
+    state: &EditorState,
+    viewport: Option<&std::ops::Range<usize>>,
+) -> Vec<ChartSpan> {
+    fence_spans(state, viewport, "chart")
+        .into_iter()
+        .map(|(byte_range, inner_range)| ChartSpan { byte_range, inner_range })
+        .collect()
+}
+
 /// Tinted-source fallback view for a diagram `lang`: a per-line background tint
 /// across the whole fenced block (fence lines inclusive). Shared by
 /// [`mermaid_decorations`] / [`wavedrom_decorations`].
@@ -263,6 +290,19 @@ pub fn wavedrom_decorations(
 ) -> DecorationSet {
     let bg = theme.map(|t| t.markdown.code_bg).unwrap_or(COLOR_WAVEDROM_BG);
     diagram_decorations(state, viewport, "wavedrom", bg)
+}
+
+/// Tinted-source fallback view for ```` ```chart ```` blocks, mirroring
+/// [`mermaid_decorations`]. Shown when widget rendering is off
+/// (`widget-render-toggle`) or the cursor is inside the span
+/// (`widget-reveal-block`). status: widget-chart-render
+pub fn chart_decorations(
+    state: &EditorState,
+    theme: Option<&Theme>,
+    viewport: Option<&std::ops::Range<usize>>,
+) -> DecorationSet {
+    let bg = theme.map(|t| t.markdown.code_bg).unwrap_or(COLOR_CHART_BG);
+    diagram_decorations(state, viewport, "chart", bg)
 }
 
 #[cfg(test)]
@@ -339,5 +379,33 @@ mod tests {
         let state = EditorState::new(src);
         let set = wavedrom_decorations(&state, None, None);
         assert!(set.iter_all().count() > 0, "wavedrom block tint emitted");
+    }
+
+    #[test]
+    fn detects_chart_fence_span() {
+        let src = "intro\n\n```chart\nmark: bar\nx: a\ny: b\n---\na,b\n1,2\n```\n\nmore\n";
+        let state = EditorState::new(src);
+        let spans = chart_spans(&state, None);
+        assert_eq!(spans.len(), 1, "one chart block");
+        let span = &spans[0];
+        assert!(src[span.byte_range.clone()].starts_with("```chart"));
+        // The inner range is the whole block body (config + `---` + inline CSV).
+        assert_eq!(&src[span.inner_range.clone()], "mark: bar\nx: a\ny: b\n---\na,b\n1,2\n");
+    }
+
+    #[test]
+    fn chart_does_not_cross_detect_with_mermaid() {
+        let src = "```chart\nmark: bar\n```\n\n```mermaid\ngraph TD; A-->B\n```\n";
+        let state = EditorState::new(src);
+        assert_eq!(chart_spans(&state, None).len(), 1, "only the chart fence");
+        assert_eq!(mermaid_spans(&state, None).len(), 1, "only the mermaid fence");
+    }
+
+    #[test]
+    fn chart_decorations_emitted() {
+        let src = "```chart\nmark: bar\nx: a\ny: b\n```\n";
+        let state = EditorState::new(src);
+        let set = chart_decorations(&state, None, None);
+        assert!(set.iter_all().count() > 0, "chart block tint emitted");
     }
 }
