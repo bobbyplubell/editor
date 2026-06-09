@@ -23,6 +23,35 @@ use smol_str::SmolStr;
 /// Transclusion chip color — muted gray, distinct from wikilink blue.
 pub const COLOR_TRANSCLUSION: Color = Color::rgb(140, 140, 150);
 
+/// The path of a single markdown image `![alt](path)` filling the whole trimmed
+/// `text`, or `None`. The renderer-unaware primitive a host re-runs over a table
+/// cell to detect an inline image (`widget-table-render`); the `app` layer
+/// vault-resolves the path and loads it to a texture. Returns the raw `path`
+/// (whatever sits between the `(` and the `)`) only when the WHOLE trimmed input
+/// is exactly one image — any prose around it yields `None`, so an ordinary text
+/// cell never matches. A `![[…]]` transclusion (double bracket) is NOT an image
+/// and is rejected. status: widget-table-render
+#[must_use]
+pub fn image_span_in_str(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("![")?;
+    // `![[` is a transclusion, not a markdown image.
+    if rest.starts_with('[') {
+        return None;
+    }
+    let body = rest.strip_suffix(')')?;
+    // Split the single `![alt](path)` into the alt text and the path. The alt
+    // ends at the first `]`, which must be immediately followed by `(`.
+    let close_bracket = body.find(']')?;
+    let after = &body[close_bracket + 1..];
+    let path = after.strip_prefix('(')?;
+    // A nested `]` or `(` (a second link/image) means this isn't a single image.
+    if path.contains(')') || path.is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
 pub fn transclusion_decorations(
     state: &EditorState,
     theme: Option<&Theme>,
@@ -108,4 +137,25 @@ pub fn transclusion_decorations(
     }
 
     RangeSet::from_iter(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_span_in_str;
+
+    #[test]
+    fn image_path_detected_in_str() {
+        // status: widget-table-render — a single `![alt](path)` cell yields the path.
+        assert_eq!(image_span_in_str("![diagram](images/flow.png)"), Some("images/flow.png"));
+        assert_eq!(image_span_in_str("  ![](logo.png)  "), Some("logo.png"), "empty alt ok");
+    }
+
+    #[test]
+    fn image_rejects_non_image_cells() {
+        assert_eq!(image_span_in_str("plain text"), None);
+        assert_eq!(image_span_in_str("![[Transclusion]]"), None, "transclusion is not an image");
+        assert_eq!(image_span_in_str("see ![a](b.png) here"), None, "prose around it");
+        assert_eq!(image_span_in_str("![a](b.png) ![c](d.png)"), None, "two images");
+        assert_eq!(image_span_in_str("![alt]()"), None, "empty path");
+    }
 }

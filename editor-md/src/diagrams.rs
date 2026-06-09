@@ -228,6 +228,55 @@ pub fn chart_spans(
         .collect()
 }
 
+/// Detect a SINGLE-LINE diagram fence in a standalone source STRING and return
+/// the inner diagram source. A pipe-table cell is one logical line (a newline
+/// ends the row), so a multi-line ```` ```lang … ``` ```` fenced block can't
+/// live in a cell; the realistic one-line spelling is an inline fence —
+/// `` ```lang <source>``` `` (triple-backtick, the `lang` info string, then the
+/// diagram source up to the closing triple-backtick, all on one line). The host
+/// re-runs this over a cell's source to find a nested diagram without building
+/// an [`EditorState`] (mirrors [`crate::equations::math_spans_in_str`]).
+///
+/// Returns the inner source `&str` (trimmed of a single leading space after the
+/// info string) only when the WHOLE trimmed input is exactly one such fence —
+/// any prose around it yields `None`, so an ordinary text cell never matches.
+/// `lang` is matched case-insensitively. status: widget-table-render
+fn inline_fence_inner<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("```")?;
+    let inner_with_lang = rest.strip_suffix("```")?;
+    // The info string is the run of non-space chars right after the opening
+    // backticks; it must equal `lang` (case-insensitive), then a separator
+    // (space or end) before the diagram source.
+    let lang_len = inner_with_lang
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(inner_with_lang.len());
+    if !inner_with_lang[..lang_len].eq_ignore_ascii_case(lang) {
+        return None;
+    }
+    let body = inner_with_lang[lang_len..].trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(body)
+}
+
+/// The inner mermaid source of a single-line ```` ```mermaid … ``` ```` fence
+/// filling the whole trimmed `text`, or `None`. The renderer-unaware primitive a
+/// host re-runs over a table cell to detect an inline mermaid diagram
+/// (`widget-table-render`); the `app` layer renders the returned source to a
+/// texture. status: widget-table-render
+pub fn mermaid_span_in_str(text: &str) -> Option<&str> {
+    inline_fence_inner(text, "mermaid")
+}
+
+/// The inner WaveJSON source of a single-line ```` ```wavedrom … ``` ```` fence
+/// filling the whole trimmed `text`, or `None` — the WaveDrom counterpart to
+/// [`mermaid_span_in_str`]. status: widget-table-render
+pub fn wavedrom_span_in_str(text: &str) -> Option<&str> {
+    inline_fence_inner(text, "wavedrom")
+}
+
 /// Tinted-source fallback view for a diagram `lang`: a per-line background tint
 /// across the whole fenced block (fence lines inclusive). Shared by
 /// [`mermaid_decorations`] / [`wavedrom_decorations`].
@@ -407,5 +456,33 @@ mod tests {
         let state = EditorState::new(src);
         let set = chart_decorations(&state, None, None);
         assert!(set.iter_all().count() > 0, "chart block tint emitted");
+    }
+
+    #[test]
+    fn inline_mermaid_fence_detected_in_str() {
+        // status: widget-table-render — a one-line ```mermaid …``` fence (the
+        // only form a pipe-table cell can hold) yields its inner source.
+        assert_eq!(mermaid_span_in_str("```mermaid graph TD; A-->B```"), Some("graph TD; A-->B"));
+        // Surrounding whitespace is tolerated; the info string is case-insensitive.
+        assert_eq!(mermaid_span_in_str("  ```Mermaid pie \"A\":1```  "), Some("pie \"A\":1"));
+    }
+
+    #[test]
+    fn inline_wavedrom_fence_detected_in_str() {
+        assert_eq!(
+            wavedrom_span_in_str("```wavedrom { signal: [] }```"),
+            Some("{ signal: [] }"),
+        );
+    }
+
+    #[test]
+    fn inline_fence_rejects_non_fence_cells() {
+        // Plain prose, a bare info-only fence, a different language, and prose
+        // around the fence all yield None (an ordinary text cell never matches).
+        assert_eq!(mermaid_span_in_str("just some text"), None);
+        assert_eq!(mermaid_span_in_str("```mermaid```"), None, "empty body");
+        assert_eq!(mermaid_span_in_str("```rust fn main(){}```"), None, "wrong lang");
+        assert_eq!(mermaid_span_in_str("see ```mermaid graph TD```"), None, "prose before");
+        assert_eq!(wavedrom_span_in_str("```mermaid graph TD; A-->B```"), None, "lang mismatch");
     }
 }

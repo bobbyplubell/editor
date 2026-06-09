@@ -241,12 +241,78 @@ pub enum BlockPaint {
     },
 }
 
+/// A widget-relative rectangle in **logical points**, top-left origin, used to
+/// position a [`ChildItem`] inside a composite [`BlockWidget`]'s reserved box.
+/// Plain `f32`s only — `editor-core` names no egui rect.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChildRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// One owned RGBA8 texture child of a composite [`BlockWidget`]: tightly-packed
+/// straight RGBA8 (`width * height * 4` bytes) in **physical** px (the producer
+/// bakes DPR in, exactly like [`WidgetPixels`]), plus the stable cache `id`.
+///
+/// Unlike [`WidgetPixels`] (a borrow of the widget's single buffer) a composite
+/// owns each child texture, so the bytes are an owned `Vec<u8>` — a table cell
+/// rasterizes its own math/diagram and hands the pixels to the painter, which
+/// caches them by `id` (a content-derived sub-region key) in the SAME
+/// [`texture-cache`](crate) the single-texture path uses. `id` MUST change
+/// whenever the bytes (including size) change so the cache invalidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildTexture {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub id: u64,
+}
+
+/// What a composite child draws: either retained native geometry (replayed like
+/// [`BlockWidget::paint_list`]) or an owned RGBA texture (blitted like
+/// [`BlockWidget::pixels`]). The composite is the union of the two single-visual
+/// paths, positioned per child — so a native-painted table grid can host a
+/// rasterized math cell without either path changing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildKind {
+    /// Native geometry, coordinates relative to the CHILD rect's top-left (the
+    /// painter offsets by the child rect, then by the widget box origin).
+    Native(Vec<BlockPaint>),
+    /// An owned RGBA texture, letterboxed into the child rect (aspect preserved).
+    Texture(ChildTexture),
+}
+
+/// One positioned child render-item of a composite [`BlockWidget`]: a
+/// widget-relative [`ChildRect`] plus the [`ChildKind`] drawn into it. The
+/// painter walks the list in order, replaying native children and blitting
+/// texture children. status: widget-table-render
+///
+/// `clip`, when `Some`, is a widget-relative [`ChildRect`] the painter intersects
+/// its draw clip with while rendering this child — so a child whose `rect`
+/// (and geometry) extends past the clip is shown only within it, the excess
+/// hidden. A Scrollable table uses this to confine its natural-width grid +
+/// children to the doc-width inset viewport (the children are pre-offset by the
+/// table's horizontal scroll; the clip is the inset box), so horizontal overflow
+/// stays inside the table and never reaches the editor. `None` (the common case,
+/// every Fit table) draws unclipped, byte-identical to before.
+/// status: widget-table-overflow-scroll
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildItem {
+    pub rect: ChildRect,
+    pub kind: ChildKind,
+    pub clip: Option<ChildRect>,
+}
+
 /// Data-side trait for block widgets injected in the vertical gap above /
-/// below a line. A widget supplies its visual either as a retained native-paint
-/// list via [`paint_list`](BlockWidget::paint_list) (replayed by the host with
-/// no texture — used by tables) or as raw pixels via
-/// [`pixels`](BlockWidget::pixels); a widget without either renders as a colored
-/// placeholder rect.
+/// below a line. A widget supplies its visual as, in precedence order: a
+/// [`composite`](BlockWidget::composite) list of positioned child render-items
+/// (native geometry XOR a texture per child — used by table cells that host
+/// rendered block content), else a single retained native-paint list via
+/// [`paint_list`](BlockWidget::paint_list) (replayed with no texture — plain
+/// tables), else raw pixels via [`pixels`](BlockWidget::pixels) (math / mermaid);
+/// a widget supplying none renders as a colored placeholder rect.
 pub trait BlockWidget: Send + Sync {
     /// Returns the laid-out height (pixels) for the given font size and
     /// available width.
@@ -264,11 +330,26 @@ pub trait BlockWidget: Send + Sync {
     fn widget_id(&self) -> u64 {
         0
     }
+    /// When `Some`, the host walks the returned positioned child render-items,
+    /// replaying each [`ChildKind::Native`] child's geometry and blitting each
+    /// [`ChildKind::Texture`] child's pixels (via the same texture cache the
+    /// single-texture [`pixels`](BlockWidget::pixels) path uses), all inside the
+    /// widget's reserved box (slug `widget-table-render`). This is the OPT-IN
+    /// container path with the HIGHEST precedence: a widget that returns a
+    /// composite is drawn from it and never reaches `paint_list` / `pixels`. A
+    /// table cell hosting rendered block content (math now; mermaid / images
+    /// later) uses this; plain tables and standalone math / mermaid leave it
+    /// `None` so their byte-identical single-visual path is untouched.
+    fn composite(&self, font_size: f32, width: f32) -> Option<Vec<ChildItem>> {
+        let _ = (font_size, width);
+        None
+    }
     /// When `Some`, the host replays the returned [`BlockPaint`] primitives
     /// natively into the widget's reserved rect — no texture, no raster
     /// (slug `widget-block-native-paint`). Takes precedence over
-    /// [`pixels`](BlockWidget::pixels): a widget that supplies a paint list is
-    /// drawn from it directly. `font_size` is the editor body font size and
+    /// [`pixels`](BlockWidget::pixels) but is itself superseded by
+    /// [`composite`](BlockWidget::composite): a widget that supplies a paint list
+    /// (and no composite) is drawn from it directly. `font_size` is the editor body font size and
     /// `width` the available widget width (both logical points), matching
     /// [`measure`](BlockWidget::measure) so the list and the reserved height
     /// agree. Default `None` keeps the texture / placeholder behavior.
@@ -584,6 +665,64 @@ mod tests {
             ..Default::default()
         })
         .affects_height());
+    }
+
+    /// A composite widget carries native + texture children; a plain widget
+    /// leaves `composite()` `None` (the byte-identical single-visual path).
+    /// status: widget-table-render
+    #[test]
+    fn composite_carries_native_and_texture_children() {
+        struct Composite;
+        impl BlockWidget for Composite {
+            fn measure(&self, _f: f32, _w: f32) -> f32 {
+                10.0
+            }
+            fn composite(&self, _f: f32, _w: f32) -> Option<Vec<ChildItem>> {
+                Some(vec![
+                    ChildItem {
+                        rect: ChildRect { x: 0.0, y: 0.0, w: 5.0, h: 5.0 },
+                        kind: ChildKind::Native(vec![BlockPaint::Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 5.0,
+                            h: 5.0,
+                            color: Color::TRANSPARENT,
+                        }]),
+                        clip: None,
+                    },
+                    ChildItem {
+                        rect: ChildRect { x: 5.0, y: 0.0, w: 5.0, h: 5.0 },
+                        kind: ChildKind::Texture(ChildTexture {
+                            rgba: vec![0, 0, 0, 0, 1, 1, 1, 1],
+                            width: 2,
+                            height: 1,
+                            id: 42,
+                        }),
+                        clip: None,
+                    },
+                ])
+            }
+        }
+        struct Plain;
+        impl BlockWidget for Plain {
+            fn measure(&self, _f: f32, _w: f32) -> f32 {
+                10.0
+            }
+        }
+
+        let children = Composite.composite(15.0, 100.0).expect("a composite");
+        assert_eq!(children.len(), 2, "two positioned children");
+        assert!(matches!(children[0].kind, ChildKind::Native(_)), "first is native");
+        match &children[1].kind {
+            ChildKind::Texture(t) => {
+                assert_eq!((t.width, t.height, t.id), (2, 1, 42));
+                assert_eq!(t.rgba.len(), (t.width * t.height * 4) as usize, "tightly packed");
+            }
+            ChildKind::Native(_) => panic!("second child should be a texture"),
+        }
+        // A plain single-visual widget never returns a composite — its
+        // paint_list / pixels path is untouched.
+        assert!(Plain.composite(15.0, 100.0).is_none(), "plain widget has no composite");
     }
 
     #[test]

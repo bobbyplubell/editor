@@ -77,6 +77,86 @@ impl InlineWidget for WikilinkWidget {
     }
 }
 
+/// The byte range of a line's trailing ` ^blockid` marker — the whitespace
+/// separator and the `^id` token together — when `line` (one logical line,
+/// no trailing newline) carries a well-formed block marker, else `None`.
+///
+/// A marker is the final token on the line, separated from preceding text by
+/// whitespace, with id charset `[A-Za-z0-9-]` (`Some prose. ^abc123`). A bare
+/// `^id` line (no preceding text), an `^id` glued to a word (`word^id`), or an
+/// incidental `^` mid-line (`2^10`, `a ^ b`) is NOT a marker. This is the exact
+/// predicate the read side uses (`core::wikilink::line_block_id` /
+/// `block_anchor_id`); the two MUST agree, so the rule is mirrored here rather
+/// than depended on across the editor's separate workspace (the same posture
+/// `is_external_link_dest` takes toward `core::url::classify`).
+///
+/// The returned range starts at the whitespace before the `^` and ends at the
+/// line's end, so concealing it also swallows the separating space — the
+/// rendered prose reads `Some prose.` with no dangling whitespace.
+///
+/// status: wikilink-block-marker-conceal
+#[must_use]
+pub fn trailing_block_marker(line: &str) -> Option<std::ops::Range<usize>> {
+    // The marker token is the last whitespace-separated token; everything
+    // before the final whitespace run must be non-empty (a bare `^id` line is
+    // not a marker — it tags nothing).
+    let trimmed_end = line.trim_end();
+    let ws_then_token = trimmed_end.rfind(char::is_whitespace)?;
+    let token = &trimmed_end[ws_then_token..].trim_start();
+    let head = &trimmed_end[..ws_then_token];
+    if head.trim().is_empty() {
+        return None;
+    }
+    let id = token.strip_prefix('^')?;
+    if id.is_empty() || !id.bytes().all(is_block_id_byte) {
+        return None;
+    }
+    // Conceal from the whitespace before the `^` to the line's logical end.
+    Some(ws_then_token..line.len())
+}
+
+/// True for a byte allowed in a block id (`[A-Za-z0-9-]`). Mirrors
+/// `core::wikilink::is_block_id_byte`; see `trailing_block_marker`.
+const fn is_block_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-'
+}
+
+/// Emit a `Replace` decoration concealing the trailing ` ^blockid` marker on
+/// every off-cursor line that carries one. The marker is an explicit handle for
+/// block-anchor links (`wikilink-block-anchors`), not prose, so it reads as
+/// noise once authored; hiding it off the cursor line and revealing the raw
+/// marker on the cursor line is the same live-preview reveal every other
+/// markup uses. Fenced code blocks are skipped so a `^id` token inside a ```
+/// fence is never concealed — matching the read side's `find_block_byte`.
+///
+/// status: wikilink-block-marker-conceal
+fn block_marker_decorations(
+    entries: &mut Vec<(std::ops::Range<usize>, Decoration)>,
+    text: &str,
+    line_of: &impl Fn(usize) -> usize,
+    cursor_line: usize,
+) {
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    for raw in text.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let trimmed = line.trim_start().trim_end();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence
+            && let Some(marker) = trailing_block_marker(line)
+        {
+            let start = offset + marker.start;
+            let end = offset + marker.end;
+            // Reveal (no conceal) when the cursor is on the marker's line.
+            if line_of(start) != cursor_line {
+                entries.push((start..end, Decoration::Replace { display: None }));
+            }
+        }
+        offset += raw.len();
+    }
+}
+
 /// True when a markdown-link destination leaves the vault — `http(s)://`,
 /// `mailto:`, or a `zim://` archive reference. Such links keep the standard
 /// markdown decoration (styled label, OS-open handled elsewhere) and are NOT
@@ -234,6 +314,12 @@ pub fn wikilink_decorations(
         }
         i += 1;
     }
+
+    // Conceal trailing ` ^blockid` block markers off the cursor line. Runs over
+    // the whole document (not viewport-scoped) so a marker scrolled to the edge
+    // still hides; the work is one line scan, cheap next to the link pass above.
+    // status: wikilink-block-marker-conceal
+    block_marker_decorations(&mut entries, &text, &line_of, cursor_line);
 
     RangeSet::from_iter(entries)
 }
@@ -404,5 +490,106 @@ mod tests {
         let ids = pill_targets(src);
         assert_eq!(ids.len(), 1);
         assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0);
+    }
+
+    #[test]
+    fn block_anchor_wikilink_emits_a_pill() {
+        // A `#^block` anchor rides the same pill path as a heading anchor; the
+        // anchor split + block resolution happen in the nav layer.
+        for src in ["x\n[[Other#^abc123]]\n", "x\n[[#^abc123]]\n"] {
+            let ids = pill_targets(src);
+            assert_eq!(ids.len(), 1, "one pill for {src:?}");
+            assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0);
+        }
+    }
+
+    #[test]
+    fn block_anchor_markdown_link_emits_a_pill() {
+        let src = "x\n[Doc](other#^abc123)\n";
+        let ids = pill_targets(src);
+        assert_eq!(ids.len(), 1, "vault md link with a block anchor is a pill");
+        assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0);
+    }
+
+    #[test]
+    fn trailing_block_marker_classifies_real_markers() {
+        // A real marker: whitespace-preceded `^id` at the end of a non-empty
+        // line. The concealed range starts at the separating space.
+        let line = "Some paragraph text. ^abc123";
+        let r = trailing_block_marker(line).expect("real marker");
+        assert_eq!(&line[r.clone()], " ^abc123");
+        // Hyphenated id is valid.
+        let line = "item ^a-b-c";
+        assert_eq!(trailing_block_marker(line).map(|r| &line[r]), Some(" ^a-b-c"));
+    }
+
+    #[test]
+    fn trailing_block_marker_rejects_incidental_carets() {
+        // Math / mid-line carets are NOT markers.
+        assert_eq!(trailing_block_marker("2^10"), None);
+        assert_eq!(trailing_block_marker("a ^ b"), None);
+        assert_eq!(trailing_block_marker("x ^id more words"), None);
+        // A caret glued to a word (no preceding whitespace) is not a marker.
+        assert_eq!(trailing_block_marker("word^abc"), None);
+        // A bare `^id` line (nothing before it) tags no block.
+        assert_eq!(trailing_block_marker("^abc"), None);
+        assert_eq!(trailing_block_marker("  ^abc"), None);
+        // Out-of-charset id (underscore) is malformed.
+        assert_eq!(trailing_block_marker("note ^under_score"), None);
+        // A bare caret is malformed.
+        assert_eq!(trailing_block_marker("note ^"), None);
+    }
+
+    /// Concealed-marker spans produced with the caret at offset 0, so the marker
+    /// line is off-cursor and the marker hides.
+    fn concealed_spans(src: &str) -> Vec<std::ops::Range<usize>> {
+        let state = EditorState::new(src);
+        let set = wikilink_decorations(&state, None, None, None);
+        set.iter_all()
+            .filter_map(|(r, d)| match d {
+                Decoration::Replace { display: None } => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_marker_concealed_off_cursor_line() {
+        // Caret at 0 (line 0); the marker on line 2 conceals.
+        let src = "intro\n\nA tagged paragraph. ^abc123\n";
+        let spans = concealed_spans(src);
+        let marker = src.find(" ^abc123").unwrap();
+        assert!(
+            spans.iter().any(|r| r.start == marker && r.end == marker + " ^abc123".len()),
+            "off-cursor marker concealed, got {spans:?}",
+        );
+    }
+
+    #[test]
+    fn block_marker_revealed_on_cursor_line() {
+        // Place the caret on the marker's line; nothing conceals there.
+        let src = "A tagged paragraph. ^abc123\nmore\n";
+        let mut state = EditorState::new(src);
+        let on_line = src.find("tagged").unwrap();
+        state.selection = editor_core::selection::Selection::single(on_line);
+        let set = wikilink_decorations(&state, None, None, None);
+        let any_conceal = set
+            .iter_all()
+            .any(|(_, d)| matches!(d, Decoration::Replace { display: None }));
+        assert!(!any_conceal, "marker on the cursor line reveals (no conceal)");
+    }
+
+    #[test]
+    fn block_marker_in_fence_not_concealed() {
+        // A `^id` token inside a fenced code block is never a marker.
+        let src = "before\n```\ncode line ^infence\n```\n";
+        assert!(concealed_spans(src).is_empty(), "fenced `^id` is not concealed");
+    }
+
+    #[test]
+    fn incidental_caret_not_concealed() {
+        // `2^10` in prose must never conceal.
+        let src = "the value 2^10 is large\nmore\n";
+        assert!(concealed_spans(src).is_empty(), "math caret not concealed");
     }
 }

@@ -67,6 +67,22 @@ pub fn math_spans(
     spans
 }
 
+/// Scan a standalone source STRING (not the document) for inline `$…$` and
+/// block `$$…$$` math spans, byte offsets relative to `text`. Same detection as
+/// [`math_spans`] minus the viewport scoping — the renderer-unaware primitive a
+/// host re-runs over a *sub-document* (e.g. a table cell's source) to find its
+/// nested math without building an [`EditorState`]. Block math wins over a `$$`
+/// mistaken for two inline delimiters, exactly like [`math_spans`].
+/// status: widget-table-render
+pub fn math_spans_in_str(text: &str) -> Vec<MathSpan> {
+    let block = scan_block_spans(text, None);
+    let block_ranges: Vec<std::ops::Range<usize>> =
+        block.iter().map(|s| s.byte_range.clone()).collect();
+    let mut spans = block;
+    spans.extend(scan_inline_spans(text, None, &block_ranges));
+    spans
+}
+
 /// Find `$$ … $$` spans (which may cross multiple lines). The closing `$$` is
 /// searched across the whole document (not just the viewport) so a block that
 /// opens on-screen but closes below the fold is still detected.
@@ -246,6 +262,21 @@ mod tests {
         // Inner range of the display span is the multi-line body.
         let disp = display[0];
         assert_eq!(&src[disp.inner_range.clone()], "\n\\int_0^1 x\\,dx\n");
+    }
+
+    #[test]
+    fn str_scan_matches_document_scan() {
+        // status: widget-table-render — the standalone-string scanner finds the
+        // same spans (offsets relative to the string) as the document scan.
+        let src = "before $x^2$ after with $$y+z$$ end";
+        let from_str = math_spans_in_str(src);
+        let state = EditorState::new(src);
+        let from_doc = math_spans(&state, None);
+        assert_eq!(from_str, from_doc, "string scan == whole-doc scan");
+        let inline = from_str.iter().find(|s| s.kind == MathKind::Inline).unwrap();
+        assert_eq!(&src[inline.inner_range.clone()], "x^2");
+        let display = from_str.iter().find(|s| s.kind == MathKind::Display).unwrap();
+        assert_eq!(&src[display.inner_range.clone()], "y+z");
     }
 
     #[test]

@@ -21,6 +21,10 @@ use editor_core::decoration::BlockPaint as CorePaint;
 
 use editor_core::decoration::BlockWidget;
 
+use editor_core::decoration::ChildItem;
+
+use editor_core::decoration::ChildKind;
+
 use editor_core::decoration::Color;
 
 use editor_core::decoration::Decoration;
@@ -34,6 +38,17 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke, TextFormat};
 
 use super::to_egui_color;
+
+/// One rich-text draw request: a wrapping `RichText` block's geometry + runs,
+/// bundled so the explicit-painter paint path stays under the argument cap.
+/// status: widget-table-overflow-scroll
+struct RichTextDraw<'a> {
+    x: f32,
+    y: f32,
+    runs: &'a [StyledRun],
+    max_width: f32,
+    align: TextAlign,
+}
 
 /// Shared painting context for block-zone helpers. Bundles the
 /// per-frame rendering environment (canvas, metrics, the click-zone
@@ -130,6 +145,31 @@ impl<'a> BlockPaint<'a> {
         rect: Rect,
     ) {
         let content_w = (rect.max.x - self.text_origin_x).max(0.0);
+        // Highest precedence: a composite container (a table cell hosting
+        // rendered block content). Walk the positioned child render-items —
+        // native geometry replayed, owned textures blitted — then register the
+        // widget's click regions exactly like the native path (the composite
+        // fills the content box 1:1, no letterbox). status: widget-table-render
+        if let Some(children) = widget.composite(self.font_size, content_w) {
+            self.paint_composite(&children, rect);
+            if widget.handles_click() {
+                for region in widget.click_regions(self.font_size, content_w) {
+                    let region_rect = Rect::from_min_max(
+                        Pos2::new(
+                            self.text_origin_x + region.x * content_w,
+                            rect.min.y + region.y * rect.height(),
+                        ),
+                        Pos2::new(
+                            self.text_origin_x + (region.x + region.w) * content_w,
+                            rect.min.y + (region.y + region.h) * rect.height(),
+                        ),
+                    );
+                    self.push_region_click_zone(region_rect, region.id);
+                }
+                self.push_widget_click_zone(widget, rect);
+            }
+            return;
+        }
         if let Some(list) = widget.paint_list(self.font_size, content_w) {
             self.paint_native(&list, rect);
             if widget.handles_click() {
@@ -232,6 +272,80 @@ impl<'a> BlockPaint<'a> {
     /// uploaded; the table widget paints this way.
     fn paint_native(&self, list: &[CorePaint], rect: Rect) {
         let origin = Pos2::new(self.text_origin_x, rect.min.y);
+        self.paint_native_at(list, origin);
+    }
+
+    /// Walk a composite's positioned child render-items into `rect` (slug
+    /// `widget-table-render`). The widget box origin is the content origin
+    /// `(text_origin_x, rect.min.y)` — identical to [`paint_native`] — so a
+    /// composite table aligns with the prose column exactly like a plain one.
+    /// Each child's [`ChildRect`] is added to that origin: native children
+    /// replay their geometry from the child's top-left, texture children blit
+    /// (letterboxed) into the child rect via the shared [`TextureCache`].
+    ///
+    /// [`ChildRect`]: editor_core::decoration::ChildRect
+    /// [`TextureCache`]: super::texture_cache::TextureCache
+    fn paint_composite(&mut self, children: &[ChildItem], rect: Rect) {
+        let origin = Pos2::new(self.text_origin_x, rect.min.y);
+        for child in children {
+            // A child carrying a `clip` (a Scrollable table's inset viewport)
+            // draws through a painter whose clip rect is intersected with that
+            // widget-relative box, so its pre-offset geometry shows only inside
+            // the inset — horizontal overflow is hidden, never reaching the
+            // editor. status: widget-table-overflow-scroll
+            match child.clip {
+                Some(clip) => {
+                    let clip_rect = Rect::from_min_max(
+                        Pos2::new(origin.x + clip.x, origin.y + clip.y),
+                        Pos2::new(origin.x + clip.x + clip.w, origin.y + clip.y + clip.h),
+                    );
+                    let clipped = self.painter.with_clip_rect(clip_rect);
+                    self.paint_child(child, origin, &clipped);
+                }
+                None => {
+                    let painter = self.painter;
+                    self.paint_child(child, origin, painter);
+                }
+            }
+        }
+    }
+
+    /// Draw one composite child through `painter` (the shared painter, or a
+    /// clip-narrowed one for a Scrollable table's inset). Native children replay
+    /// their geometry from the child's top-left; texture children blit
+    /// (letterboxed) into the child rect. status: widget-table-render
+    fn paint_child(&mut self, child: &ChildItem, origin: Pos2, painter: &egui::Painter) {
+        let child_origin = Pos2::new(origin.x + child.rect.x, origin.y + child.rect.y);
+        match &child.kind {
+            ChildKind::Native(list) => self.paint_native_at_with(list, child_origin, painter),
+            ChildKind::Texture(tex) => {
+                let child_rect = Rect::from_min_max(
+                    child_origin,
+                    Pos2::new(child_origin.x + child.rect.w, child_origin.y + child.rect.h),
+                );
+                let pixels = editor_core::decoration::WidgetPixels {
+                    rgba: &tex.rgba,
+                    width: tex.width,
+                    height: tex.height,
+                };
+                self.texture_cache.blit(self.ui, painter, tex.id, &pixels, child_rect);
+            }
+        }
+    }
+
+    /// Replay a native-paint list with its top-left at `origin` (screen-space
+    /// logical points). The widget-box path passes the content origin; the
+    /// composite path passes the content origin plus a child rect.
+    fn paint_native_at(&self, list: &[CorePaint], origin: Pos2) {
+        let painter = self.painter;
+        self.paint_native_at_with(list, origin, painter);
+    }
+
+    /// As [`paint_native_at`](Self::paint_native_at) but draws through an
+    /// explicit `painter` — the shared one for the unclipped path, or a
+    /// clip-narrowed one for a Scrollable table's inset child.
+    /// status: widget-table-overflow-scroll
+    fn paint_native_at_with(&self, list: &[CorePaint], origin: Pos2, painter: &egui::Painter) {
         for prim in list {
             match prim {
                 CorePaint::Rect { x, y, w, h, color } => {
@@ -239,10 +353,10 @@ impl<'a> BlockPaint<'a> {
                         Pos2::new(origin.x + x, origin.y + y),
                         Pos2::new(origin.x + x + w, origin.y + y + h),
                     );
-                    self.painter.rect_filled(r, 0.0, to_egui_color(*color));
+                    painter.rect_filled(r, 0.0, to_egui_color(*color));
                 }
                 CorePaint::Line { from, to, width, color } => {
-                    self.painter.line_segment(
+                    painter.line_segment(
                         [
                             Pos2::new(origin.x + from.0, origin.y + from.1),
                             Pos2::new(origin.x + to.0, origin.y + to.1),
@@ -262,11 +376,14 @@ impl<'a> BlockPaint<'a> {
                         TextAlign::Center => anchor_x - galley.size().x * 0.5,
                         TextAlign::Right => anchor_x - galley.size().x,
                     };
-                    self.painter
-                        .galley(Pos2::new(left_x, origin.y + y), galley, fg);
+                    painter.galley(Pos2::new(left_x, origin.y + y), galley, fg);
                 }
                 CorePaint::RichText { x, y, runs, max_width, align } => {
-                    self.paint_rich_text(origin, *x, *y, runs, *max_width, *align);
+                    self.paint_rich_text_with(
+                        painter,
+                        origin,
+                        &RichTextDraw { x: *x, y: *y, runs, max_width: *max_width, align: *align },
+                    );
                 }
             }
         }
@@ -277,33 +394,30 @@ impl<'a> BlockPaint<'a> {
     /// `(x, y)` (widget-box-relative) wrapped to `max_width`, horizontally
     /// aligned by `align` against `max_width`. The per-run inline-code
     /// background box is painted behind the resolved glyph rows.
-    fn paint_rich_text(
-        &self,
-        origin: Pos2,
-        x: f32,
-        y: f32,
-        runs: &[StyledRun],
-        max_width: f32,
-        align: TextAlign,
-    ) {
-        let galley = self.ui.fonts(|f| f.layout_job(self.rich_job(runs, max_width, false)));
-        let anchor_x = origin.x + x;
-        let left_x = match align {
+    /// Draw a wrapping `RichText` block through an explicit `painter` (the shared
+    /// one, or a clip-narrowed one for a Scrollable table's inset child). Lays the
+    /// runs as a single multi-format galley anchored at `(d.x, d.y)`
+    /// (widget-box-relative) wrapped to `d.max_width`, horizontally aligned by
+    /// `d.align`. status: widget-table-overflow-scroll
+    fn paint_rich_text_with(&self, painter: &egui::Painter, origin: Pos2, d: &RichTextDraw<'_>) {
+        let galley = self.ui.fonts(|f| f.layout_job(self.rich_job(d.runs, d.max_width, false)));
+        let anchor_x = origin.x + d.x;
+        let left_x = match d.align {
             TextAlign::Left => anchor_x,
-            TextAlign::Center => anchor_x + (max_width - galley.size().x).max(0.0) * 0.5,
-            TextAlign::Right => anchor_x + (max_width - galley.size().x).max(0.0),
+            TextAlign::Center => anchor_x + (d.max_width - galley.size().x).max(0.0) * 0.5,
+            TextAlign::Right => anchor_x + (d.max_width - galley.size().x).max(0.0),
         };
         let fg = self.ui.visuals().text_color();
-        let pos = Pos2::new(left_x, origin.y + y);
-        self.painter.galley(pos, galley, fg);
+        let pos = Pos2::new(left_x, origin.y + d.y);
+        painter.galley(pos, galley, fg);
         // Faux-bold: egui has no per-section weight and the app registers no
         // bold family, so re-paint a galley identical in layout but with only
         // the bold runs visible (others transparent), shifted 0.5px — the same
         // double-paint idiom the main text layout uses. Identical text/wrap →
         // the rows line up exactly. Skip the extra galley when no run is bold.
-        if runs.iter().any(|r| r.bold) {
-            let bold = self.ui.fonts(|f| f.layout_job(self.rich_job(runs, max_width, true)));
-            self.painter.galley(Pos2::new(pos.x + 0.5, pos.y), bold, fg);
+        if d.runs.iter().any(|r| r.bold) {
+            let bold = self.ui.fonts(|f| f.layout_job(self.rich_job(d.runs, d.max_width, true)));
+            painter.galley(Pos2::new(pos.x + 0.5, pos.y), bold, fg);
         }
     }
 
