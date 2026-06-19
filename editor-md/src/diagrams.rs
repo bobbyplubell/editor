@@ -241,7 +241,7 @@ pub fn chart_spans(
 /// info string) only when the WHOLE trimmed input is exactly one such fence —
 /// any prose around it yields `None`, so an ordinary text cell never matches.
 /// `lang` is matched case-insensitively. status: widget-table-render
-fn inline_fence_inner<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
+fn single_line_fence_body<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
     let trimmed = text.trim();
     let rest = trimmed.strip_prefix("```")?;
     let inner_with_lang = rest.strip_suffix("```")?;
@@ -267,14 +267,14 @@ fn inline_fence_inner<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 /// (`widget-table-render`); the `app` layer renders the returned source to a
 /// texture. status: widget-table-render
 pub fn mermaid_span_in_str(text: &str) -> Option<&str> {
-    inline_fence_inner(text, "mermaid")
+    single_line_fence_body(text, "mermaid")
 }
 
 /// The inner WaveJSON source of a single-line ```` ```wavedrom … ``` ```` fence
 /// filling the whole trimmed `text`, or `None` — the WaveDrom counterpart to
 /// [`mermaid_span_in_str`]. status: widget-table-render
 pub fn wavedrom_span_in_str(text: &str) -> Option<&str> {
-    inline_fence_inner(text, "wavedrom")
+    single_line_fence_body(text, "wavedrom")
 }
 
 /// Tinted-source fallback view for a diagram `lang`: a per-line background tint

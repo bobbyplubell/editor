@@ -216,31 +216,48 @@ pub fn wikilink_decorations(
             continue;
         }
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            // Find closing `]]` on the same logical span (no newlines inside).
-            let mut j = i + 2;
-            let mut closed = None;
-            while j + 1 < bytes.len() {
-                if bytes[j] == b'\n' {
-                    break;
-                }
-                if bytes[j] == b']' && bytes[j + 1] == b']' {
-                    closed = Some(j);
-                    break;
-                }
-                j += 1;
-            }
-            let Some(close_start) = closed else {
-                i += 1;
-                continue;
-            };
             let inner_start = i + 2;
+            // A `code:`-namespaced body may carry nested `[`…`]` groups and
+            // backtick spans (impl monikers: `impl#[`Builder<'a>`]method`), so
+            // it gets the depth-aware close matcher. Everything else keeps the
+            // flat rule below, byte-for-byte: a stray `]` still rejects.
+            // status: wikilink-code-nested-brackets
+            let close_start = if text[inner_start..].starts_with("code:") {
+                match code_body_close(&text, inner_start) {
+                    Some(close_start) => close_start,
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else {
+                // Find closing `]]` on the same logical span (no newlines inside).
+                let mut j = inner_start;
+                let mut closed = None;
+                while j + 1 < bytes.len() {
+                    if bytes[j] == b'\n' {
+                        break;
+                    }
+                    if bytes[j] == b']' && bytes[j + 1] == b']' {
+                        closed = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                let Some(close_start) = closed else {
+                    i += 1;
+                    continue;
+                };
+                let inner = &text[inner_start..close_start];
+                if inner.is_empty() || inner.contains(']') {
+                    i = close_start + 2;
+                    continue;
+                }
+                close_start
+            };
             let inner_end = close_start;
             let full_end = close_start + 2;
             let inner = &text[inner_start..inner_end];
-            if inner.is_empty() || inner.contains(']') {
-                i = full_end;
-                continue;
-            }
 
             // Path-form (`wikilink-path-form`): the entire body is the target;
             // no `|alias` half. The display falls back to the target verbatim
@@ -322,6 +339,44 @@ pub fn wikilink_decorations(
     block_marker_decorations(&mut entries, &text, &line_of, cursor_line);
 
     RangeSet::from_iter(entries)
+}
+
+/// Byte offset of the closing `]]` of a `code:`-namespaced wikilink body starting at `from`
+/// (the byte after `[[`), or `None` when the body never closes on its line. Unlike the flat
+/// rule in `wikilink_decorations`, a code body may carry nested `[`…`]` groups and backtick
+/// spans — the canonical short-sym moniker form qualifies impl methods as
+/// `impl#[`Builder<'a>`]method` — so the matcher tracks bracket depth, treats backtick spans
+/// as opaque, and closes on the first `]]` at depth zero outside backticks. A stray `]` at
+/// depth zero that isn't the closer is malformed (no parse), matching the flat rule's
+/// strictness for everything non-nested. This is the exact matcher the app-side parser uses
+/// (`core::wikilink::code_body_close`); the two scanners MUST agree on what is a link, so the
+/// rule is mirrored here rather than depended on across the editor's separate workspace (the
+/// same posture `trailing_block_marker` takes toward `core::wikilink::line_block_id`).
+/// status: wikilink-code-nested-brackets
+fn code_body_close(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_backtick = false;
+    let mut j = from;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\n' => return None,
+            b'`' => in_backtick = !in_backtick,
+            b'[' if !in_backtick => depth += 1,
+            b']' if !in_backtick => {
+                if depth > 0 {
+                    depth -= 1;
+                } else if bytes.get(j + 1) == Some(&b']') {
+                    return Some(j);
+                } else {
+                    return None; // stray `]` at depth zero — malformed body
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
 }
 
 /// Faint pill background tinted from the link color (low alpha).
@@ -509,6 +564,105 @@ mod tests {
         let ids = pill_targets(src);
         assert_eq!(ids.len(), 1, "vault md link with a block anchor is a pill");
         assert_ne!(ids[0] & WIKILINK_WIDGET_TAG, 0);
+    }
+
+    /// Pill spans produced with the caret at offset 0, so off-cursor links
+    /// collapse; the resolver maps every target to a title (resolved).
+    fn pill_spans(src: &str) -> Vec<std::ops::Range<usize>> {
+        let state = EditorState::new(src);
+        let resolve = |_: &str| Some("Title".to_string());
+        let set = wikilink_decorations(&state, None, None, Some(&resolve));
+        set.iter_all()
+            .filter_map(|(r, d)| match d {
+                Decoration::InlineWidget { .. } => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn code_wikilinks_with_nested_brackets_become_pills() {
+        // The four standing impl-qualified bodies from
+        // bug-editor-code-pill-scanner-flat (clustering.md): nested `[`/`]`
+        // plus backtick spans inside `[[code:…]]`. Mirrors
+        // `core::wikilink::parses_code_links_with_nested_brackets_and_backticks`.
+        let bodies = [
+            "code:hiker/cluster/build/impl#[`Builder<'a>`]top_level_split",
+            "code:hiker/cluster/build/impl#[`Builder<'a>`]build_top_level_nodes",
+            "code:hiker/cluster/build/impl#[`Builder<'a>`]split_branch_ctx",
+            "code:hiker/cluster/build/impl#[`SplitBranchCtx<'a>`]split_top_level_groups",
+        ];
+        for body in bodies {
+            let src = format!("x\nimplements:: [[{body}]], [[code:hiker/x/y]]\n");
+            let spans = pill_spans(&src);
+            assert_eq!(spans.len(), 2, "{body}");
+            assert_eq!(&src[spans[0].clone()], format!("[[{body}]]"));
+            assert_eq!(
+                &src[spans[1].clone()],
+                "[[code:hiker/x/y]]",
+                "scan resumes after the close",
+            );
+        }
+        // Bare bracket group (no backticks) and a two-group (self type + trait) qualifier.
+        let src = "x\n[[code:hiker/tab/impl#[TabKind]git_diff_preview]] and \
+                   [[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]id]]\n";
+        let spans = pill_spans(src);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&src[spans[0].clone()], "[[code:hiker/tab/impl#[TabKind]git_diff_preview]]");
+        assert_eq!(
+            &src[spans[1].clone()],
+            "[[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]id]]",
+        );
+    }
+
+    #[test]
+    fn malformed_code_bodies_emit_no_pill() {
+        // Unterminated / multi-line / unclosed-backtick / stray-`]` code bodies
+        // stay rejected. Mirrors `core::wikilink::malformed_code_bodies_do_not_parse`.
+        for src in [
+            "x\n[[code:hiker/impl#[`X`]m\n",     // no close
+            "x\n[[code:hiker/impl#[`X\n`]m]]\n", // newline inside
+            "x\n[[code:hiker/a/[b]]\n",          // unclosed bracket eats the close
+            "x\n[[code:hiker/a`b]]\n",           // unclosed backtick swallows the close
+            "x\n[[code:hiker/a]b]]\n",           // stray `]` at depth zero
+        ] {
+            assert!(pill_spans(src).is_empty(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_body_with_stray_bracket_still_rejects() {
+        // The flat rule for non-`code:` bodies is unchanged byte-for-byte.
+        assert!(pill_spans("x\n[[a]b]]\n").is_empty());
+    }
+
+    #[test]
+    fn nested_code_body_reaches_the_resolver_verbatim() {
+        // The pill's label comes from the host's title resolver, keyed by the
+        // verbatim body — the nested form must arrive intact so the host can
+        // supply the pretty label (`Builder::top_level_split`).
+        let src = "x\n[[code:hiker/cluster/build/impl#[`Builder<'a>`]top_level_split]]\n";
+        let state = EditorState::new(src);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let resolve = |t: &str| {
+            seen.borrow_mut().push(t.to_string());
+            Some("Builder::top_level_split".to_string())
+        };
+        let set = wikilink_decorations(&state, None, None, Some(&resolve));
+        let labels: Vec<String> = set
+            .iter_all()
+            .filter_map(|(_, d)| match d {
+                Decoration::InlineWidget { widget, .. } => {
+                    widget.display().map(|disp| disp.text.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["Builder::top_level_split"]);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            ["code:hiker/cluster/build/impl#[`Builder<'a>`]top_level_split"],
+        );
     }
 
     #[test]

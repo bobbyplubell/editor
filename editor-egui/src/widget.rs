@@ -9,6 +9,7 @@ use editor_core::decoration::Decoration;
 use editor_core::state::Editor as EditorState;
 use editor_core::transaction::Transaction;
 
+use editor_core::decoration::GutterMarker;
 use editor_core::decoration::LineStyle;
 
 use editor_view::command;
@@ -1184,6 +1185,50 @@ impl<'a> PaintCtx<'a> {
 
     fn paint_gutter(&mut self, span: RowSpan) {
         let RowSpan { line_idx, byte_start: line_byte_start, byte_end: line_byte_end, top_y: line_top_y, height: row_height } = span;
+        // Dirty-diff gutter strip: paint a thin colored marker at the gutter's
+        // left edge for any line carrying a `Diff*` gutter marker (git
+        // working-tree-vs-HEAD, plus the pre-existing index_diff layer). Mirrors
+        // the per-line `Decoration::Line` lookup in `paint_line_bgs`.
+        for layer in &self.view.decorations.layers {
+            for (range, deco) in layer.iter_overlapping(line_byte_start..line_byte_end + 1) {
+                if let Decoration::Line(LineStyle { gutter_marker: Some(marker), .. }) = deco {
+                    if self.state.doc.byte_to_line(range.start) != line_idx {
+                        continue;
+                    }
+                    match marker {
+                        GutterMarker::DiffAdded | GutterMarker::DiffModified => {
+                            let color = if matches!(marker, GutterMarker::DiffAdded) {
+                                egui::Color32::from_rgb(78, 201, 119)
+                            } else {
+                                egui::Color32::from_rgb(66, 133, 244)
+                            };
+                            let strip = Rect::from_min_max(
+                                Pos2::new(self.rect.left(), line_top_y),
+                                Pos2::new(self.rect.left() + 3.0, line_top_y + row_height),
+                            );
+                            self.painter.rect_filled(strip, 0.0, color);
+                        }
+                        GutterMarker::DiffRemoved => {
+                            // A small caret at the top-left edge marks lines
+                            // removed just above this one.
+                            let size = self.base_font_id.size * 0.42;
+                            let x = self.rect.left() + 1.0;
+                            let points = vec![
+                                Pos2::new(x, line_top_y),
+                                Pos2::new(x + size, line_top_y),
+                                Pos2::new(x, line_top_y + size),
+                            ];
+                            self.painter.add(egui::Shape::convex_polygon(
+                                points,
+                                egui::Color32::from_rgb(229, 83, 75),
+                                Stroke::NONE,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let num = (line_idx + 1).to_string();
         let num_galley = self
             .ui

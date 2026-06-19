@@ -1,10 +1,11 @@
 //! Per-language `TsLanguage` bundles, gated by cargo features.
 //!
 //! [`bundle`] returns a fully-populated [`crate::TsLanguage`] for one
-//! [`Language`]. They are stubs in this crate — the actual
-//! `tree-sitter-{rust,python,javascript,…}` crates are intentionally **not**
-//! depended on, because pulling them all in roughly doubles CI build time
-//! and most consumers want only one or two.
+//! [`Language`]. Rust and Python are wired (optional deps pulled in by their
+//! `lang-*` feature); the rest are stubs — the remaining
+//! `tree-sitter-{javascript,…}` crates are intentionally **not** depended on,
+//! because pulling them all in roughly doubles CI build time and most
+//! consumers want only one or two.
 //!
 //! # Wiring a real grammar (host instructions)
 //!
@@ -66,16 +67,26 @@ pub enum Language {
 
 /// Return the grammar bundle for a feature-gated built-in [`Language`].
 ///
-/// Every arm currently panics with a TODO until the host wires in the real
-/// `tree-sitter-<lang>` crate; replace the matching arm with the upstream
-/// grammar (see the module docs for the procedure). When no `lang-*` feature
-/// is enabled, [`Language`] is uninhabited and this function cannot be called.
-pub const fn bundle(language: Language) -> TsLanguage {
+/// Rust and Python are wired to their upstream grammar crates; the remaining
+/// arms panic with a TODO until a host wires in the real `tree-sitter-<lang>`
+/// crate (see the module docs for the procedure). When no `lang-*` feature is
+/// enabled, [`Language`] is uninhabited and this function cannot be called.
+pub fn bundle(language: Language) -> TsLanguage {
     match language {
         #[cfg(feature = "lang-rust")]
-        Language::Rust => panic!("editor-ts: `rust` bundle stub; wire `tree-sitter-rust` in languages.rs"),
+        Language::Rust => TsLanguage {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            highlights_query: tree_sitter_rust::HIGHLIGHTS_QUERY.to_string(),
+            injections_query: Some(tree_sitter_rust::INJECTIONS_QUERY.to_string()),
+            indent_query: None,
+        },
         #[cfg(feature = "lang-python")]
-        Language::Python => panic!("editor-ts: `python` bundle stub; wire `tree-sitter-python` in languages.rs"),
+        Language::Python => TsLanguage {
+            language: tree_sitter_python::LANGUAGE.into(),
+            highlights_query: tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
+            injections_query: None, // upstream grammar ships no injections.scm
+            indent_query: None,
+        },
         #[cfg(feature = "lang-javascript")]
         Language::Javascript => panic!("editor-ts: `javascript` bundle stub; wire `tree-sitter-javascript` in languages.rs"),
         #[cfg(feature = "lang-typescript")]

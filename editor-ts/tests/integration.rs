@@ -54,10 +54,36 @@ fn theme_is_consumable_by_ts_decorations_signature() {
     let _tokens = theme.tokens.len();
 }
 
-#[ignore = "needs real grammar; use `cargo test --features lang-json` once language deps are wired"]
+#[cfg(feature = "lang-rust")]
 #[test]
-fn end_to_end_parse_and_highlight() {
-    // Placeholder for the real test, kept here so wiring it later is a
-    // one-liner: `editor_ts::languages::bundle(Language::Json)`, parse a JSON
-    // doc, and assert that `ts_decorations` produces at least one Mark.
+fn rust_end_to_end_parse_and_highlight() {
+    use editor_ts::languages::{bundle, Language};
+    let lang = bundle(Language::Rust);
+    let src = "/// docs\nfn main() { let s = \"hi\"; }\n";
+    let ts = parse(&lang, src);
+    let tags: Vec<&str> = ts.highlights.iter().map(|(_, t)| t.as_str()).collect();
+    assert!(tags.iter().any(|t| t.starts_with("keyword")), "fn/let captured: {tags:?}");
+    assert!(tags.iter().any(|t| t.starts_with("string")), "string literal captured");
+    assert!(tags.iter().any(|t| t.starts_with("comment")), "doc comment captured");
+
+    let state = EditorState::new(src);
+    let decos = ts_decorations(&state, &ts, Some(&light_default()));
+    assert!(decos.iter_all().next().is_some(), "highlights become Mark decorations");
+}
+
+#[cfg(feature = "lang-python")]
+#[test]
+fn python_end_to_end_parse_and_highlight() {
+    use editor_ts::languages::{bundle, Language};
+    let lang = bundle(Language::Python);
+    let src = "def f(x):\n    # note\n    return 'hi'\n";
+    let ts = parse(&lang, src);
+    let tags: Vec<&str> = ts.highlights.iter().map(|(_, t)| t.as_str()).collect();
+    assert!(tags.iter().any(|t| t.starts_with("keyword")), "def/return captured: {tags:?}");
+    assert!(tags.iter().any(|t| t.starts_with("string")), "string literal captured");
+    assert!(tags.iter().any(|t| t.starts_with("comment")), "comment captured");
+
+    let state = EditorState::new(src);
+    let decos = ts_decorations(&state, &ts, Some(&light_default()));
+    assert!(decos.iter_all().next().is_some(), "highlights become Mark decorations");
 }

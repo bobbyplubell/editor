@@ -11,14 +11,15 @@ tree-sitter.workspace = true
 streaming-iterator = "0.1"
 smol_str.workspace = true
 smallvec.workspace = true
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
 
 [features]
-# Per-language feature flags. Each gates a bundle in `languages.rs`. The
-# actual `tree-sitter-{rust,python,…}` dependencies are intentionally not
-# wired yet — hosts that need them should add the dep and uncomment the
-# corresponding bundle (see `languages.rs`).
-lang-rust = []
-lang-python = []
+# Per-language feature flags. Each gates a bundle in `languages.rs`. Wired
+# bundles (rust, python) pull their grammar crate via an optional dep; the
+# rest are stubs — wire the dep + the bundle arm together (see `languages.rs`).
+lang-rust = ["dep:tree-sitter-rust"]
+lang-python = ["dep:tree-sitter-python"]
 lang-javascript = []
 lang-typescript = []
 lang-bash = []
